@@ -1,0 +1,1754 @@
+// ==UserScript==
+// @name         gota fun v2
+// @namespace    http://tampermonkey.net/
+// @version      7.2.0
+// @description  v7.2.0: Rendimiento en sesiones largas -- el barrido ante mutaciones ya no recorre todo el `body`. Antes, cualquier mutación fuera del chat disparaba _sweepAll() completo (en lotes, así que nunca bloqueaba, pero su costo total crecía con la cantidad de nodos del documento -- y esa cantidad solo puede subir con las horas). Ahora _moCb encola los nodos agregados de cada tanda y el flush escanea solo esos nodos y sus subárboles; el costo por flush queda atado a lo que cambió, no al tamaño total del DOM. Si la cola se desborda (250 raíces en una sola tanda), cae una vez a un barrido completo como red de seguridad, con la misma infraestructura chunked de siempre. Input: el foco del canvas se reenganchaba solo en mousedown -- se agregó pointerdown (se dispara antes en el orden de eventos del spec), adelantando el .focus() del canvas unos milisegundos respecto al mismo click real; mismo throttle de 500ms compartido, mismo elemento, sin capturar posición ni movimiento nuevo. Rendimiento menor: se sacó un cv.style.setProperty('outline', 'none') redundante en cada hookup de canvas -- la hoja _apex_perf ya cubre `canvas { outline: none !important; }` para todos los canvas desde v6.0.0.
+//
+// v7.0.0: REMAKE.
+// v6.0.0 (reimaginado): núcleo mínimo + interruptores de diagnóstico.
+// @author       funkiid
+// @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
+// @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
+// @icon         https://cdn.shopify.com/s/files/1/0125/8261/7145/files/BOYFRIEND_PLUSH_TOY-SV4-P-1_1000x.png.webp?v=1726159538
+// @match        https://gota.io/web/*
+// @match        https://play.gota.io/*
+// @match        https://gota.io/*
+// @match        https://gota.io/camlan/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+
+(function () {
+'use strict';
+
+const SCRIPT_VERSION = '7.2.0';
+const W = window, D = document;
+
+const RENDER_SCALE = 1.0;
+const RETINA_PERF_MODE = false;
+const QUIET_CONSOLE = false;
+
+let _lsOff = '', _lsDebug = false;
+try {
+    _lsOff = W.localStorage.getItem('gf_off') || '';
+    _lsDebug = W.localStorage.getItem('gf_debug') === '1';
+} catch (_) {}
+const _OFF = new Set(_lsOff.split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+const _ALL_OFF = _OFF.has('all');
+const _on = k => !_ALL_OFF && !_OFF.has(k);
+const DEBUG = _lsDebug && !_ALL_OFF;
+
+W.__gf = {
+    version: SCRIPT_VERSION,
+    off: Array.from(_OFF),
+    debug: DEBUG,
+    set(off, debug) {
+        try {
+            if (off !== undefined) W.localStorage.setItem('gf_off', String(off));
+            if (debug !== undefined) W.localStorage.setItem('gf_debug', debug ? '1' : '0');
+        } catch (_) {}
+        return 'Recargá la página (F5) para aplicar.';
+    },
+};
+
+if (_ALL_OFF) {
+    try {
+        Object.defineProperty(W, '__GOTA_FUN__', {
+            value: Object.freeze({ version: SCRIPT_VERSION, off: true, readyStateAtLoad: D.readyState }),
+            writable: false, configurable: false, enumerable: false,
+        });
+    } catch (_) {}
+    return;
+}
+
+if (RETINA_PERF_MODE) {
+    try { Object.defineProperty(W, 'devicePixelRatio', { get: () => 1, configurable: true }); } catch (_) {}
+}
+
+const NOP = () => {};
+const RL = D.head || D.documentElement;
+const _pNow      = performance.now.bind(performance);
+const _rAF       = W.requestAnimationFrame.bind(W);
+const _st        = W.setTimeout.bind(W);
+const _si        = W.setInterval.bind(W);
+const _origCE    = D.createElement.bind(D);
+const _elRemove  = Element.prototype.remove;
+const _aEL       = EventTarget.prototype.addEventListener;
+const _rEL       = EventTarget.prototype.removeEventListener;
+
+const OPT_P  = Object.freeze({ passive: true });
+const OPT_O  = Object.freeze({ once: true, passive: true });
+const OPT_AC = Object.freeze({ capture: true, passive: false });
+
+const _hDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
+               Object.getOwnPropertyDescriptor(D, 'hidden');
+const _getRealHidden = (_hDesc && _hDesc.get)
+    ? () => { try { return _hDesc.get.call(D); } catch (_) { return false; } }
+    : () => false;
+
+let _tabHidden = _getRealHidden();
+let _inGame = false;
+let _isNewServer = true;
+let _lastWSOrigin = null;
+let _gameCanvas = null, _cvFocusTs = 0;
+let _inTextField = false;
+let _joinGraceUntil = 0;
+let _sacredStyleEl = null, _perfStyleEl = null;
+let _loader = null;
+
+const _idle = (fn, timeout) => {
+    if (W.requestIdleCallback) W.requestIdleCallback(fn, { timeout });
+    else _st(fn, 16);
+};
+
+const _hasInputPendingAPI = !!(navigator.scheduling && typeof navigator.scheduling.isInputPending === 'function');
+const _isInputPending = _hasInputPendingAPI ? () => navigator.scheduling.isInputPending() : () => false;
+
+const _lru = (max) => {
+    const m = new Map();
+    return {
+        get(k) {
+            if (!m.has(k)) return undefined;
+            const v = m.get(k);
+            m.delete(k); m.set(k, v);
+            return v;
+        },
+        set(k, v) {
+            if (m.has(k)) { m.delete(k); }
+            else if (m.size >= max) { m.delete(m.keys().next().value); }
+            m.set(k, v);
+        }
+    };
+};
+
+const STAT = { sweeps: 0, sweepMs: 0, sweepMaxMs: 0, flushes: 0 };
+
+const _dbgLog = [];
+const _dbg = e => { _dbgLog.push(e); if (_dbgLog.length > 600) _dbgLog.splice(0, 200); };
+if (DEBUG) {
+    try {
+        const PO = W.PerformanceObserver;
+        if (PO) {
+            const types = PO.supportedEntryTypes || [];
+            if (types.indexOf('long-animation-frame') !== -1) {
+                new PO(list => {
+                    const es = list.getEntries();
+                    for (let i = 0; i < es.length; i++) {
+                        const e = es[i], sc = e.scripts || [];
+                        let top = '', dur = 0;
+                        for (let s = 0; s < sc.length; s++) {
+                            if (sc[s].duration > dur) { dur = sc[s].duration; top = sc[s].invoker || sc[s].sourceURL || ''; }
+                        }
+                        _dbg({ t: 'LoAF', d: e.duration | 0, top, topD: dur | 0, at: e.startTime | 0 });
+                    }
+                }).observe({ type: 'long-animation-frame' });
+            } else if (types.indexOf('longtask') !== -1) {
+                new PO(list => {
+                    const es = list.getEntries();
+                    for (let i = 0; i < es.length; i++) _dbg({ t: 'LongTask', d: es[i].duration | 0, at: es[i].startTime | 0 });
+                }).observe({ type: 'longtask' });
+            }
+            if (types.indexOf('event') !== -1) {
+                new PO(list => {
+                    const es = list.getEntries();
+                    for (let i = 0; i < es.length; i++) {
+                        const dl = es[i].processingStart - es[i].startTime;
+                        if (dl > 16) _dbg({ t: 'InputDelay', n: es[i].name, d: dl | 0, at: es[i].startTime | 0 });
+                    }
+                }).observe({ type: 'event', durationThreshold: 16 });
+            }
+        }
+    } catch (_) {}
+    (function () {
+        let last = 0;
+        const f = ts => { if (last && ts - last > 50) _dbg({ t: 'Jank', d: (ts - last) | 0, at: ts | 0 }); last = ts; _rAF(f); };
+        _rAF(f);
+    })();
+}
+
+const _report = () => {
+    const g = Object.create(null);
+    for (let i = 0; i < _dbgLog.length; i++) { const e = _dbgLog[i]; (g[e.t] || (g[e.t] = [])).push(e); }
+    const stat = (arr) => {
+        if (!arr || !arr.length) return { n: 0, avg: 0, p95: 0, max: 0 };
+        const v = arr.map(e => e.d).sort((a, b) => a - b), n = v.length;
+        return { n, avg: (v.reduce((s, x) => s + x, 0) / n) | 0, p95: v[Math.floor(n * 0.95)] | 0, max: v[n - 1] | 0 };
+    };
+    const agg = Object.create(null);
+    (g.LoAF || []).forEach(e => { const k = e.top || '(desconocido)'; const a = agg[k] || (agg[k] = { n: 0, ms: 0 }); a.n++; a.ms += e.topD; });
+    const topOffenders = Object.keys(agg).map(k => ({ script: k, n: agg[k].n, ms: agg[k].ms })).sort((a, b) => b.ms - a.ms).slice(0, 5);
+    return {
+        Jank: stat(g.Jank), LongTask: stat(g.LongTask), LoAF: stat(g.LoAF), InputDelay: stat(g.InputDelay),
+        topOffenders, ownCost: Object.assign({}, STAT), entries: _dbgLog.length,
+    };
+};
+W.__gf.report = _report;
+W.__gf.stats = () => Object.assign({}, STAT, { inGame: _inGame, tabHidden: _tabHidden });
+W.__freezeSummary = _report;
+
+if (QUIET_CONSOLE && !DEBUG) {
+    const _nukedKeys = ['log','debug','info','warn','error','trace','group','groupEnd','groupCollapsed','table','count','dir','dirxml','assert','clear'];
+    try {
+        const c = Object.create(W.console || Object.prototype);
+        for (let i = 0; i < _nukedKeys.length; i++) c[_nukedKeys[i]] = NOP;
+        Object.defineProperty(W, 'console', { get: () => c, set: NOP, configurable: false });
+    } catch (_) {
+        try { const c = W.console; for (let i = 0; i < _nukedKeys.length; i++) try { c[_nukedKeys[i]] = NOP; } catch (_2) {} } catch (_2) {}
+    }
+}
+
+const _ORI = location.origin;
+const _BLK_RX = new RegExp('google-analytics\\.com|googletagmanager\\.com|googletagservices\\.com|googlesyndication\\.com|doubleclick\\.net|googleadservices\\.com|facebook\\.net|analytics\\.facebook\\.com|onesignal\\.com|hotjar\\.com|clarity\\.ms|mixpanel\\.com|amplitude\\.com|fullstory\\.com|segment\\.com|segment\\.io|sentry\\.io|browser\\.sentry-cdn\\.com|newrelic\\.com|nr-data\\.net|datadoghq\\.com|logrocket\\.com|posthog\\.com|plausible\\.io|mouseflow\\.com|luckyorange\\.com|smartlook\\.com|heap\\.io|heapanalytics\\.com|static\\.cloudflareinsights\\.com|cloudflareinsights\\.com|cdn\\.addinplay\\.com|addinplay\\.com|pubmatic\\.com|criteo\\.com|taboola\\.com|outbrain\\.com|raygun\\.io|bugsnag\\.com|rubiconproject\\.com|openx\\.net|amazon-adsystem\\.com|optimizely\\.com|quantserve\\.com|comscore\\.com|chartbeat\\.com|parsely\\.com|branch\\.io|adjust\\.com|kochava\\.com|appsflyer\\.com|moengage\\.com|clevertap\\.com|leanplum\\.com|analytics\\.tiktok\\.com|px\\.ads\\.linkedin\\.com|ct\\.pinterest\\.com', 'i');
+
+const _sbCache = _lru(200);
+function _sb(url) {
+    if (!url) return 0;
+    const s = typeof url === 'string' ? url : '' + url;
+    const c0 = s.charCodeAt(0);
+    if (c0 === 47 || c0 === 100 || c0 === 98 || c0 === 119) return 0;
+    if (s.startsWith(_ORI)) return 0;
+    let hn;
+    try { hn = new URL(s, _ORI).hostname; } catch (_) { return 0; }
+    const cached = _sbCache.get(hn);
+    if (cached !== undefined) return cached;
+    const r = _BLK_RX.test(hn) ? 1 : 0;
+    _sbCache.set(hn, r);
+    return r;
+}
+
+const _AD_SEL = '#main-left-ad, #main-right-ad, #main-bottom-ad, .ad-container, [id^="div-gpt-ad"], [id^="google_ads"], [id*="-ad-container"]';
+const _isAdPlaceholderText = (text) => text.indexOf('Advertisement') !== -1 || text.indexOf('Adblock!') !== -1;
+
+const _trashCan = new Set();
+let _trashPending = false;
+const _emptyTrash = () => {
+    _trashPending = false;
+    _trashCan.forEach(el => { try { _elRemove.call(el); } catch (_) {} });
+    _trashCan.clear();
+};
+const _scheduleTrash = (typeof queueMicrotask === 'function') ? queueMicrotask : fn => Promise.resolve().then(fn);
+const _blkEl = el => {
+    _trashCan.add(el);
+    if (!_trashPending) { _trashPending = true; _scheduleTrash(_emptyTrash); }
+};
+
+const _preconnectedOrigins = new Map();
+const _preconnectEls = new Map();
+const PRECONNECT_TTL_MS = 30000;
+const _preconnectOrigin = origin => {
+    if (!_on('net') || !origin) return;
+    const now = _pNow();
+    const last = _preconnectedOrigins.get(origin);
+    if (last !== undefined && (now - last) < PRECONNECT_TTL_MS) return;
+    _preconnectedOrigins.set(origin, now);
+    try {
+        const prev = _preconnectEls.get(origin);
+        if (prev) {
+            try { if (prev.pc && prev.pc.isConnected) _elRemove.call(prev.pc); } catch (_) {}
+            try { if (prev.dp && prev.dp.isConnected) _elRemove.call(prev.dp); } catch (_) {}
+        }
+        const frag = D.createDocumentFragment();
+        const pc = _origCE('link'); pc.rel = 'preconnect'; pc.href = origin; pc.crossOrigin = 'anonymous'; try { pc.fetchPriority = 'high'; } catch (_) {} frag.appendChild(pc);
+        const dp = _origCE('link'); dp.rel = 'dns-prefetch'; dp.href = origin; frag.appendChild(dp);
+        (D.head || D.documentElement).appendChild(frag);
+        _preconnectEls.set(origin, { pc, dp });
+    } catch (_) {}
+};
+
+if (_on('net')) {
+    try { W.ga = W.gtag = W.fbq = W._fbq = NOP; W.dataLayer = { push: NOP }; D.write = D.writeln = NOP; } catch (_) {}
+
+    try { W.addEventListener('securitypolicyviolation', e => { e.stopImmediatePropagation(); e.preventDefault(); }, true); } catch (_) {}
+    try { if (W.ReportingObserver) W.ReportingObserver = () => ({ observe: NOP, disconnect: NOP }); } catch (_) {}
+
+    try {
+        const _origFetch = W.fetch;
+        W.fetch = function (inp, init) {
+            const u = typeof inp === 'string' ? inp : inp instanceof URL ? inp.href : (inp && inp.url ? inp.url : '');
+            if (_sb(u)) return Promise.resolve(new Response('', { status: 200 }));
+            return init === undefined ? _origFetch.call(W, inp) : _origFetch.call(W, inp, init);
+        };
+    } catch (_) {}
+
+    try {
+        const _xBlk = new WeakSet();
+        const _oXO = XMLHttpRequest.prototype.open;
+        const _oXS = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u, a, us, pw) {
+            const url = typeof u === 'string' ? u : '' + u;
+            if (_sb(url)) _xBlk.add(this);
+            return us !== undefined ? _oXO.call(this, m, u, a, us, pw) : a !== undefined ? _oXO.call(this, m, u, a) : _oXO.call(this, m, u);
+        };
+        XMLHttpRequest.prototype.send = function (d) {
+            if (_xBlk.has(this)) return;
+            return d !== undefined ? _oXS.call(this, d) : _oXS.call(this);
+        };
+    } catch (_) {}
+
+    try {
+        const _OrigWrk = W.Worker;
+        W.Worker = function (url, opts) {
+            if (typeof url === 'string' && _sb(url)) return { postMessage: NOP, terminate: NOP };
+            return opts !== undefined ? new _OrigWrk(url, opts) : new _OrigWrk(url);
+        };
+        W.Worker.prototype = _OrigWrk.prototype;
+        Object.setPrototypeOf(W.Worker, _OrigWrk);
+    } catch (_) {}
+
+    try {
+        const _origSendBeacon = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+        navigator.sendBeacon = function (url, data) { if (_sb(url)) return true; return _origSendBeacon ? _origSendBeacon(url, data) : true; };
+    } catch (_) {}
+
+    try {
+        const _pp = (proto, prop) => {
+            const d = Object.getOwnPropertyDescriptor(proto, prop);
+            if (!d || !d.set) return;
+            const orig = d.set;
+            Object.defineProperty(proto, prop, {
+                get: d.get,
+                set(v) { if (_sb(typeof v === 'string' ? v : '' + v)) { _blkEl(this); return; } orig.call(this, v); },
+                configurable: true
+            });
+        };
+        _pp(HTMLScriptElement.prototype, 'src');
+        _pp(HTMLIFrameElement.prototype, 'src');
+        _pp(HTMLLinkElement.prototype, 'href');
+        _pp(HTMLImageElement.prototype, 'src');
+    } catch (_) {}
+
+    try {
+        const ckD = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
+                    Object.getOwnPropertyDescriptor(D, 'cookie');
+        if (ckD && ckD.set) {
+            const oCKS = ckD.set;
+            const CKP = ['_ga=', '_gid=', '_gat=', '_gcl', '_fbp=', '_fbc=', '_hjid=', 'ph_', 'mp_'];
+            Object.defineProperty(D, 'cookie', {
+                get: ckD.get && ckD.get.bind(D),
+                set(v) {
+                    const s = typeof v === 'string' ? v : '' + v;
+                    for (let i = 0; i < CKP.length; i++) if (s.startsWith(CKP[i])) return;
+                    oCKS.call(D, s);
+                },
+                configurable: true
+            });
+        }
+    } catch (_) {}
+
+    try {
+        const _BAD = ['_ga', '_gid', '_gat', '_gcl', '_fbp', '_fbc', '_hjid', '_hjSession', 'amplitude_', 'amp_', 'ajs_', 'mp_', 'clarity-', 'ph_', 'posthog'];
+        const _BAD_RX = new RegExp('^(?:' + _BAD.join('|') + ')');
+        const _oLSSet = Storage.prototype.setItem;
+        const _oLSDel = Storage.prototype.removeItem;
+        Storage.prototype.setItem = function (k, v) {
+            const key = typeof k === 'string' ? k : '' + k;
+            if (_BAD_RX.test(key)) return;
+            return _oLSSet.call(this, key, v);
+        };
+        const _wipeStorage = () => {
+            try {
+                const st = W.localStorage; const toDelete = []; let i = st.length;
+                while (i--) { try { const k = st.key(i); if (k && _BAD_RX.test(k)) toDelete.push(k); } catch (_) {} }
+                i = toDelete.length; while (i--) try { _oLSDel.call(st, toDelete[i]); } catch (_) {}
+            } catch (_) {}
+        };
+        _wipeStorage();
+        _si(_wipeStorage, 120000);
+    } catch (_) {}
+
+    try {
+        const _idbBlk = new Set(['amplitude', 'mixpanel', 'analytics', 'clarity', 'posthog', 'segment', 'hotjar', 'sentry', 'newrelic', 'datadog']);
+        const _FAKE = Object.freeze({ result: null, error: null, readyState: 'done', onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null, addEventListener: NOP, removeEventListener: NOP, dispatchEvent: () => false });
+        const _idbO = indexedDB.open.bind(indexedDB);
+        indexedDB.open = function (name, ver) {
+            if (typeof name === 'string') {
+                const n = name.toLowerCase();
+                if (!n.includes('gota') && !n.includes('firebase') && !n.includes('google') && !n.includes('auth'))
+                    for (const b of _idbBlk) if (n.includes(b)) return _FAKE;
+            }
+            return ver !== undefined ? _idbO(name, ver) : _idbO(name);
+        };
+    } catch (_) {}
+
+    try {
+        const _pCRT = performance.clearResourceTimings && performance.clearResourceTimings.bind(performance);
+        const _pSRTS = performance.setResourceTimingBufferSize && performance.setResourceTimingBufferSize.bind(performance);
+        if (_pSRTS) _pSRTS(0);
+        if (_pCRT) _pCRT();
+    } catch (_) {}
+
+    try {
+        const _conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (_conn) {
+            Object.defineProperty(_conn, 'saveData', { get: () => false, configurable: true });
+            try { Object.defineProperty(_conn, 'effectiveType', { get: () => '4g', configurable: true }); } catch (_) {}
+            try { Object.defineProperty(_conn, 'downlink', { get: () => 10, configurable: true }); } catch (_) {}
+            try { Object.defineProperty(_conn, 'rtt', { get: () => 50, configurable: true }); } catch (_) {}
+        }
+    } catch (_) {}
+
+    try {
+        const frag = D.createDocumentFragment();
+        const hs = [
+            ['//accounts.google.com','high'],['//oauth2.googleapis.com','high'],
+            ['//apis.google.com','high'],['//securetoken.googleapis.com','high'],
+            ['//game.gota.io','high'],['//play.gota.io','high'],
+            ['//us.gota.io','auto'],['//us2.gota.io','auto'],
+            ['//eu.gota.io','auto'],['//eu2.gota.io','auto'],
+            ['//ap.gota.io','low'],['//sg.gota.io','low'],
+            ['//br.gota.io','low'],['//kr.gota.io','low'],['//au.gota.io','low']
+        ];
+        for (let i = 0; i < hs.length; i++) {
+            const pc = _origCE('link'); pc.rel = 'preconnect'; pc.href = hs[i][0]; pc.crossOrigin = 'anonymous';
+            try { pc.fetchPriority = hs[i][1]; } catch (_) {} frag.appendChild(pc);
+            const dp = _origCE('link'); dp.rel = 'dns-prefetch'; dp.href = hs[i][0]; frag.appendChild(dp);
+            try { _preconnectedOrigins.set(new URL(hs[i][0], location.href).origin, _pNow()); } catch (_) {}
+        }
+        RL.appendChild(frag);
+    } catch (_) {}
+
+    try {
+        _aEL.call(W, 'online', () => {
+            if (_lastWSOrigin) { _preconnectedOrigins.delete(_lastWSOrigin); _preconnectOrigin(_lastWSOrigin); }
+        }, OPT_P);
+    } catch (_) {}
+}
+
+let _audioCtx = null, _audioGestureOk = false;
+const _initAudio = () => {
+    try {
+        if (_audioCtx) { if (_audioCtx.state === 'suspended') _audioCtx.resume().catch(NOP); else if (_audioCtx.state === 'closed') { _audioCtx = null; _initAudio(); } return; }
+        const AC = W.AudioContext || W.webkitAudioContext; if (!AC) return;
+        _audioCtx = new AC({ latencyHint: 'playback', sampleRate: 8000 });
+        const buf = _audioCtx.createBuffer(1, _audioCtx.sampleRate, _audioCtx.sampleRate);
+        const ch = buf.getChannelData(0); let i = ch.length; while (i--) ch[i] = (i & 1 ? 1 : -1);
+        const src = _audioCtx.createBufferSource(); src.buffer = buf; src.loop = true;
+        const gain = _audioCtx.createGain();
+        gain.gain.value = 0.001;
+        src.connect(gain); gain.connect(_audioCtx.destination); src.start(0);
+    } catch (_) {}
+};
+const _suspendAudio = () => { try { if (_audioCtx && _audioCtx.state === 'running') _audioCtx.suspend(); } catch (_) {} };
+const _resumeAudio = () => {
+    if (!_audioGestureOk) return;
+    try { if (!_audioCtx) { _initAudio(); return; } if (_audioCtx.state === 'suspended') _audioCtx.resume().catch(NOP); else if (_audioCtx.state === 'closed') { _audioCtx = null; _initAudio(); } } catch (_) {}
+};
+
+let _storagePersistDone = false;
+const _requestStoragePersist = () => {
+    if (_storagePersistDone) return;
+    try {
+        if (navigator.storage && navigator.storage.persist) {
+            _storagePersistDone = true;
+            navigator.storage.persist().catch(NOP);
+        }
+    } catch (_) {}
+};
+
+if (_on('ws')) {
+    try {
+        const _OrigWS = W.WebSocket;
+        const _origWSSend = _OrigWS.prototype.send;
+        const GfWS = function WebSocket(url, protos) {
+            _isNewServer = true;
+            try { _lastWSOrigin = new URL(url, location.href).origin.replace(/^wss?:/, 'https:'); _preconnectOrigin(_lastWSOrigin); } catch (_) {}
+            const ws = protos !== undefined ? new _OrigWS(url, protos) : new _OrigWS(url);
+            try {
+                Object.defineProperty(ws, 'binaryType', { get() { return 'arraybuffer'; }, set() {}, configurable: true });
+            } catch (_) { ws.binaryType = 'arraybuffer'; }
+            Object.defineProperty(ws, 'send', { value: _origWSSend, writable: false, configurable: false });
+            _resumeAudio();
+            _requestStoragePersist();
+            return ws;
+        };
+        GfWS.prototype = _OrigWS.prototype;
+        Object.setPrototypeOf(GfWS, _OrigWS);
+        Object.defineProperty(GfWS, Symbol.hasInstance, { value: o => o instanceof _OrigWS, writable: false, configurable: true });
+        W.WebSocket = GfWS;
+    } catch (_) {}
+}
+
+const _RS_ACTIVE = (typeof RENDER_SCALE === 'number' && RENDER_SCALE > 0 && RENDER_SCALE !== 1);
+const _rsWDesc = _RS_ACTIVE ? Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width')  : null;
+const _rsHDesc = _RS_ACTIVE ? Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height') : null;
+const _rsDiag = { hooked: false, tag: null, width: 0, height: 0, offscreenTransferSeen: false };
+
+const _applyRenderScale = (cv) => {
+    if (!_RS_ACTIVE || cv._apexRSHooked) return;
+    if (!_rsWDesc || !_rsWDesc.set || !_rsHDesc || !_rsHDesc.set) return;
+    cv._apexRSHooked = true;
+    try {
+        const mk = (desc, cssProp) => ({
+            get() { return desc.get.call(this); },
+            set(v) {
+                const target = Math.max(1, Math.round(v * RENDER_SCALE));
+                desc.set.call(this, target);
+                try { this.style.setProperty(cssProp, v + 'px', 'important'); } catch (_) {}
+            },
+            configurable: true
+        });
+        Object.defineProperty(cv, 'width',  mk(_rsWDesc, 'width'));
+        Object.defineProperty(cv, 'height', mk(_rsHDesc, 'height'));
+        const w0 = _rsWDesc.get.call(cv), h0 = _rsHDesc.get.call(cv);
+        if (w0 > 1 && h0 > 1) { cv.width = w0; cv.height = h0; }
+        _rsDiag.hooked = true; _rsDiag.tag = cv.tagName; _rsDiag.width = cv.width; _rsDiag.height = cv.height;
+    } catch (_) {}
+};
+
+if (_RS_ACTIVE) {
+    try {
+        const _origTransfer = HTMLCanvasElement.prototype.transferControlToOffscreen;
+        if (typeof _origTransfer === 'function') {
+            HTMLCanvasElement.prototype.transferControlToOffscreen = function () {
+                _applyRenderScale(this);
+                _rsDiag.offscreenTransferSeen = true;
+                return _origTransfer.call(this);
+            };
+        }
+    } catch (_) {}
+}
+
+const _setupGameCanvasFocus = (cv) => {
+    try {
+        // v7.2.0: se sacó el cv.style.setProperty('outline', 'none', ...)
+        // de acá -- rendimiento pequeño, pero real. La hoja _apex_perf ya
+        // tiene `canvas { outline: none !important; }` para TODOS los
+        // canvas de la página (sección de estilos, más abajo) desde el
+        // rewrite de v6.0.0 -- esta línea era una escritura de estilo
+        // inline redundante en cada hookup de canvas, disparando una
+        // invalidación de estilo por algo que el CSS ya cubría sin ella.
+        cv.tabIndex = -1; cv.focus({ preventScroll: true });
+        const _refocus = () => {
+            const n = _pNow(); if (n - _cvFocusTs > 500) { _cvFocusTs = n; cv.focus({ preventScroll: true }); }
+        };
+        // v7.2.0 -- INPUT: pointerdown además de mousedown. pointerdown se
+        // dispara ANTES que mousedown en el orden de eventos del spec
+        // (PointerEvent primero; el mismo click dispara después el
+        // MouseEvent legacy) -- agregarlo adelanta el refoco del canvas
+        // unos milisegundos respecto al mismo click real. _cvFocusTs es
+        // compartido entre los dos listeners: pointerdown hace el refoco y
+        // marca el timestamp; mousedown, milisegundos después, ya lo
+        // encuentra dentro de la ventana de 500ms y no hace nada -- mismo
+        // throttle, mismo elemento, sin capturar posición ni movimiento
+        // nuevo, es la misma lógica de siempre enganchada a un evento que
+        // llega antes.
+        _aEL.call(cv, 'pointerdown', _refocus, OPT_P);
+        _aEL.call(cv, 'mousedown', _refocus, OPT_P);
+    } catch (_) {}
+};
+
+if (_on('canvas')) {
+    try {
+        const _origGetCtx = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+            if (type === '2d') {
+                if (this._apexCtx2dDone) return _origGetCtx.call(this, type, attrs);
+                this._apexCtx2dDone = true;
+                const a = attrs ? Object.assign({}, attrs) : {};
+                if (a.alpha == null) a.alpha = true;
+                if (a.willReadFrequently == null) a.willReadFrequently = false;
+                if (a.powerPreference == null) a.powerPreference = 'high-performance';
+                const ctx = _origGetCtx.call(this, type, a);
+                if (ctx) {
+                    try { ctx.imageSmoothingEnabled = false; } catch (_) {}
+                    try { ctx.imageSmoothingQuality = 'low'; } catch (_) {}
+                }
+                return ctx;
+            }
+            if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+                if (this._apexCtxDone) return _origGetCtx.call(this, type, attrs);
+                const a = attrs ? Object.assign({}, attrs) : {};
+                if (a.powerPreference == null) a.powerPreference = 'high-performance';
+                a.desynchronized = false;
+                a.antialias  = a.antialias != null ? a.antialias : false;
+                a.depth      = a.depth     != null ? a.depth     : false;
+                a.stencil    = a.stencil   != null ? a.stencil   : false;
+                a.premultipliedAlpha = a.premultipliedAlpha != null ? a.premultipliedAlpha : true;
+                a.preserveDrawingBuffer = false; a.failIfMajorPerformanceCaveat = false;
+                const ctx = _origGetCtx.call(this, type, a);
+                if (!ctx) return ctx;
+                this._apexCtxDone = true;
+                _gameCanvas = this;
+                _applyRenderScale(this);
+                _setupGameCanvasFocus(this);
+                try { _aEL.call(this, 'webglcontextlost', e => { e.preventDefault(); }, { passive: false }); } catch (_) {}
+                return ctx;
+            }
+            if (type === 'webgpu') {
+                if (this._apexCtxDone) return _origGetCtx.call(this, type, attrs);
+                const ctx = _origGetCtx.call(this, type, attrs);
+                if (!ctx) return ctx;
+                this._apexCtxDone = true;
+                _gameCanvas = this;
+                _applyRenderScale(this);
+                return ctx;
+            }
+            return _origGetCtx.call(this, type, attrs);
+        };
+    } catch (_) {}
+
+    try {
+        if (navigator.gpu && typeof navigator.gpu.requestAdapter === 'function') {
+            const _origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+            navigator.gpu.requestAdapter = function (opts) {
+                const next = opts ? Object.assign({}, opts) : {};
+                if (!next.powerPreference) next.powerPreference = 'high-performance';
+                return _origRequestAdapter(next);
+            };
+        }
+    } catch (_) {}
+}
+
+W.__gf.canvas = () => ({
+    renderScaleTarget: RENDER_SCALE,
+    renderScaleActive: _RS_ACTIVE,
+    hookedGameCanvas: _rsDiag.hooked ? { tag: _rsDiag.tag, width: _rsDiag.width, height: _rsDiag.height } : null,
+    offscreenTransferSeen: _rsDiag.offscreenTransferSeen,
+    gameCanvasFound: !!_gameCanvas,
+});
+
+let _wakelock = null, _wakelockPending = false;
+const _acqWL = async () => {
+    if (_wakelockPending || _wakelock || !navigator.wakeLock) return;
+    _wakelockPending = true;
+    try {
+        _wakelock = await navigator.wakeLock.request('screen');
+        _wakelock.addEventListener('release', () => { _wakelock = null; if (!_tabHidden) _st(_acqWL, 1000); }, OPT_O);
+    } catch (_) {
+    } finally {
+        _wakelockPending = false;
+    }
+};
+
+if (_on('tab')) {
+    try {
+        Object.defineProperty(D, 'hidden', { get: () => false, configurable: true });
+        Object.defineProperty(D, 'visibilityState', { get: () => 'visible', configurable: true });
+        try {
+            Object.defineProperty(Document.prototype, 'hidden', { get: () => false, configurable: true });
+            Object.defineProperty(Document.prototype, 'visibilityState', { get: () => 'visible', configurable: true });
+        } catch (_) {}
+    } catch (_) {}
+    try { Document.prototype.hasFocus = function () { return true; }; } catch (_) {}
+
+    const _onRealVisibility = () => {
+        const realHidden = _getRealHidden();
+        if (realHidden && !_tabHidden) {
+            _tabHidden = true;
+            try { if (_wakelock) _wakelock.release(); } catch (_) {} _wakelock = null;
+            _suspendAudio();
+        } else if (!realHidden && _tabHidden) {
+            _tabHidden = false; _resumeAudio(); _acqWL();
+            if (_lastWSOrigin) { _preconnectedOrigins.delete(_lastWSOrigin); _preconnectOrigin(_lastWSOrigin); }
+            _sweepSoon(200);
+            if (_gameCanvas) {
+                _st(() => {
+                    try { if (!_tabHidden && !_inTextField) _gameCanvas.focus({ preventScroll: true }); } catch (_) {}
+                }, 50);
+            }
+        }
+    };
+    _aEL.call(D, 'visibilitychange', _onRealVisibility, true);
+
+    _aEL.call(D, 'DOMContentLoaded', _acqWL, OPT_O);
+    try { _aEL.call(W, 'focus', () => { if (!_wakelock) _acqWL(); }, OPT_P); } catch (_) {}
+    try {
+        _aEL.call(W, 'pageshow', e => {
+            if (!e.persisted) return;
+            _wakelock = null;
+            _resumeAudio();
+            if (!_tabHidden) _acqWL();
+        }, OPT_P);
+    } catch (_) {}
+
+    const _onFirstGesture = () => {
+        _audioGestureOk = true; _initAudio();
+        try { _rEL.call(D, 'click',      _onFirstGesture, true); } catch (_) {}
+        try { _rEL.call(D, 'keydown',    _onFirstGesture, true); } catch (_) {}
+        try { _rEL.call(D, 'touchstart', _onFirstGesture, true); } catch (_) {}
+    };
+    _aEL.call(D, 'click',      _onFirstGesture, { capture: true, passive: true, once: true });
+    _aEL.call(D, 'keydown',    _onFirstGesture, { capture: true, passive: true, once: true });
+    _aEL.call(D, 'touchstart', _onFirstGesture, { capture: true, passive: true, once: true });
+}
+_aEL.call(D, 'DOMContentLoaded', _requestStoragePersist, OPT_O);
+
+if (_on('input')) {
+    const _NOTEXT = new Set(['checkbox', 'radio', 'range', 'button', 'submit', 'reset', 'file', 'image', 'color']);
+    _aEL.call(W, 'focusin', e => {
+        const target = e.target;
+        if (!target || target === _gameCanvas) { _inTextField = false; return; }
+        const t = target.tagName;
+        if (t === 'INPUT') { _inTextField = !_NOTEXT.has((target.type || '').toLowerCase()); return; }
+        if (t === 'TEXTAREA' || t === 'SELECT' || target.isContentEditable) { _inTextField = true; return; }
+        const role = target.getAttribute ? target.getAttribute('role') : null;
+        _inTextField = !!(role && (role === 'textbox' || role === 'combobox' || role === 'listbox' || role === 'searchbox'));
+    }, true);
+    _aEL.call(W, 'focusout', () => { _inTextField = false; }, true);
+
+    _aEL.call(W, 'selectstart', e => { if (!_inTextField) e.preventDefault(); }, OPT_AC);
+    _aEL.call(W, 'contextmenu', e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_AC);
+    _aEL.call(W, 'dragstart',   e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_AC);
+
+    const _ignoredCodes = new Set([
+        'Space', 'Tab',
+        'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+        'KeyW', 'KeyA', 'KeyS', 'KeyD',
+        'KeyE', 'KeyQ', 'KeyR', 'KeyF',
+        'Backspace',
+        'F5',
+    ]);
+    _aEL.call(W, 'keydown', e => {
+        if (_ignoredCodes.has(e.code) && !_inTextField && !e.isComposing &&
+            !e.ctrlKey && !e.altKey && !e.metaKey) e.preventDefault();
+    }, OPT_AC);
+}
+
+const _injectStyles = () => {
+    try {
+        const head = D.head || D.documentElement;
+        const frag = D.createDocumentFragment();
+        const pc1 = _origCE('link'); pc1.rel = 'preconnect'; pc1.href = 'https://fonts.googleapis.com'; frag.appendChild(pc1);
+        const pc2 = _origCE('link'); pc2.rel = 'preconnect'; pc2.href = 'https://fonts.gstatic.com'; pc2.crossOrigin = 'anonymous'; frag.appendChild(pc2);
+        const fontLink = _origCE('link');
+        fontLink.rel = 'stylesheet';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Karla:wght@400;700&display=swap';
+        fontLink.id = '_apex_font';
+        fontLink.media = 'print';
+        fontLink.onload = function () { this.onload = null; this.media = 'all'; };
+        frag.appendChild(fontLink);
+        head.insertBefore(frag, head.firstChild);
+    } catch (_) {}
+
+    const sacredStyle = _origCE('style');
+    sacredStyle.id = '_apex_sacred';
+    sacredStyle.textContent = `
+        :root {
+            --apex-v1: #3a1c71;
+            --apex-v2: #8a2be2;
+            --apex-v3: #d76d77;
+            --apex-ink: #e9e4f5;
+            --apex-line: rgba(138, 43, 226, 0.30);
+            --apex-line-hot: rgba(215, 109, 119, 0.65);
+        }
+
+        body {
+            font-family: 'Karla', sans-serif !important;
+            cursor: url("data:image/svg+xml;charset=utf-8,%3Csvg width='32' height='32' viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cline x1='16' y1='2' x2='16' y2='30' stroke='%238a2be2' stroke-width='2' stroke-linecap='round'/%3E%3Cline x1='2' y1='16' x2='30' y2='16' stroke='%238a2be2' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23d76d77' stroke='%233a1c71' stroke-width='1'/%3E%3C/svg%3E") 16 16, crosshair !important;
+        }
+        .logo, #logo, img[src*="logo"] {
+            display: none !important;
+        }
+
+        .xp-meter {
+            background: rgba(5, 5, 16, 0.55) !important;
+            border: 1px solid var(--apex-line) !important;
+            border-radius: 999px !important; overflow: hidden !important;
+            position: relative !important; height: 10px !important;
+        }
+        .xp-meter > span {
+            position: relative !important; display: block !important; height: 100% !important;
+            background: linear-gradient(90deg, #020111, var(--apex-v1), var(--apex-v3), var(--apex-v1), #020111) !important;
+            background-size: 200% 100% !important; animation: nebulaMove 6s linear infinite !important;
+        }
+        .xp-meter > span::before {
+            content: "" !important; position: absolute !important; top: 0; left: 0; right: 0; bottom: 0 !important;
+            background-image: radial-gradient(1px 1px at 10% 20%, #fff, transparent), radial-gradient(1.5px 1.5px at 40% 50%, #fff, transparent), radial-gradient(1px 1px at 80% 10%, #fff, transparent) !important;
+            background-size: 100px 100% !important; animation: starsMove 3s linear infinite !important; opacity: 0.6 !important;
+        }
+        @keyframes nebulaMove { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
+        @keyframes starsMove { from { background-position: 0 0; } to { background-position: -100px 0; } }
+
+        #score-panel, #party-panel {
+            background: rgba(4, 2, 10, 0.22) !important;
+            border: 1px solid rgba(255, 255, 255, 0.04) !important;
+            border-radius: 10px !important;
+            box-shadow: none !important;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.9) !important;
+        }
+        #minimap-panel {
+            background: rgba(4, 2, 10, 0.14) !important;
+            border: 1px solid rgba(255, 255, 255, 0.04) !important;
+            border-radius: 10px !important;
+            box-shadow: none !important;
+            opacity: 0.6 !important;
+        }
+
+        #leaderboard-panel {
+            font-family: 'Karla', sans-serif !important;
+            background: linear-gradient(180deg, rgba(14, 7, 28, 0.55), rgba(6, 3, 14, 0.42)) !important;
+            border: 1px solid var(--apex-line) !important;
+            border-top: 1px solid var(--apex-line-hot) !important;
+            border-radius: 10px !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05) !important;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.9) !important;
+        }
+        #leaderboard-panel * { font-family: 'Karla', sans-serif !important; }
+
+        .main-panel {
+            background: linear-gradient(180deg, rgba(16, 8, 32, 0.62), rgba(7, 3, 16, 0.50)) !important;
+            border: 1px solid var(--apex-line) !important;
+            border-top: 1px solid var(--apex-line-hot) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.06),
+                        0 18px 40px rgba(0, 0, 0, 0.45) !important;
+            border-radius: 14px !important;
+            padding: 22px !important;
+            transition: border-color 0.3s ease, box-shadow 0.3s ease,
+                        opacity 0.2s ease, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1) !important;
+            align-self: flex-start !important;
+            animation: apexMenuIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+            height: auto !important; min-height: 0 !important; max-height: none !important;
+            contain: layout paint !important;
+        }
+        .main-panel:hover {
+            border-color: rgba(138, 43, 226, 0.55) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.09),
+                        0 22px 50px rgba(0, 0, 0, 0.5) !important;
+        }
+
+        .apex-menu-row { display: flex !important; align-items: flex-start !important; gap: 18px !important; }
+        .apex-left-col { display: flex !important; flex-direction: column !important; gap: 6px !important; }
+        .apex-menu-grid { display: grid !important; grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
+        .apex-menu-grid > * {
+            width: 100% !important; min-width: 0 !important; box-sizing: border-box !important;
+            padding: 11px 8px !important; min-height: 42px !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
+            text-align: center !important; line-height: 1.15 !important; white-space: normal !important;
+            overflow: visible !important;
+            background-color: rgba(255, 255, 255, 0.025) !important;
+            border: 1px solid rgba(255, 255, 255, 0.06) !important;
+            border-radius: 9px !important;
+        }
+        .apex-extra-grid {
+            display: grid !important; grid-template-columns: 1fr 1fr !important;
+            gap: 6px !important; margin-top: 6px !important;
+        }
+        .apex-extra-grid > * {
+            width: 100% !important; min-width: 0 !important; margin: 0 !important;
+            box-sizing: border-box !important; box-shadow: none !important;
+            padding: 10px 8px !important; min-height: 40px !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
+            text-align: center !important; line-height: 1.15 !important; white-space: normal !important;
+            font-size: 13px !important; border-radius: 9px !important;
+            background-color: rgba(255, 255, 255, 0.025) !important;
+            border: 1px solid rgba(255, 255, 255, 0.06) !important;
+            cursor: pointer !important; overflow: hidden !important; position: relative !important;
+            contain: layout style paint !important;
+            transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1) !important;
+        }
+        .apex-extra-grid > *:hover {
+            background-color: rgba(138, 43, 226, 0.32) !important;
+            border-color: var(--apex-v2) !important;
+            box-shadow: 0 0 12px rgba(138, 43, 226, 0.4) !important;
+            transform: translateY(-1px) !important;
+        }
+        .apex-extra-grid > *:active { transform: scale(0.96) !important; transition-duration: 0.08s !important; }
+
+        .main-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+        .main-panel select, .main-panel textarea {
+            background: rgba(10, 5, 20, 0.55) !important;
+            border: 1px solid var(--apex-line) !important;
+            color: var(--apex-ink) !important;
+            border-radius: 9px !important; padding: 10px !important;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5) !important;
+        }
+        .main-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+        .main-panel select:focus, .main-panel textarea:focus {
+            border-color: var(--apex-v3) !important;
+            box-shadow: 0 0 0 2px rgba(215, 109, 119, 0.22), inset 0 1px 2px rgba(0, 0, 0, 0.5) !important;
+            outline: none !important;
+        }
+        .main-panel input[type="checkbox"], .main-panel input[type="radio"] { accent-color: var(--apex-v2) !important; }
+
+        #chat-container {
+            background: rgba(2, 1, 6, 0.20) !important;
+            border-radius: 10px !important;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.95) !important;
+        }
+        #chat-input {
+            background: rgba(2, 1, 6, 0.35) !important;
+            border: 1px solid rgba(255, 255, 255, 0.05) !important;
+            color: var(--apex-ink) !important;
+            border-radius: 8px !important;
+        }
+
+        .gota-btn, button {
+            background-color: rgba(255, 255, 255, 0.025) !important;
+            border: 1px solid rgba(255, 255, 255, 0.06) !important;
+            color: var(--apex-ink) !important;
+            border-radius: 9px !important;
+            transition: background-color 0.2s ease, border-color 0.2s ease,
+                        box-shadow 0.2s ease, transform 0.12s cubic-bezier(0.34, 1.56, 0.64, 1) !important;
+        }
+        .gota-btn:hover, button:hover, .server-table tr:hover {
+            background-color: rgba(138, 43, 226, 0.32) !important;
+            border-color: var(--apex-v2) !important;
+            box-shadow: 0 0 12px rgba(138, 43, 226, 0.4) !important;
+            cursor: pointer !important;
+        }
+        .gota-btn:hover, button:hover { transform: translateY(-1px) !important; }
+        .gota-btn:active, button:active { transform: scale(0.96) !important; transition-duration: 0.08s !important; }
+
+        .main-panel button, .main-panel .gota-btn,
+        .main-panel img + *, .server-table td:first-child {
+            background-image: linear-gradient(90deg, var(--apex-v1), var(--apex-v2), var(--apex-v3), var(--apex-v2), var(--apex-v1)) !important;
+            background-size: 200% 100% !important;
+            -webkit-background-clip: text !important; background-clip: text !important;
+            color: transparent !important; -webkit-text-fill-color: transparent !important;
+            animation: nebulaMove 6s linear infinite !important;
+            font-weight: 700 !important;
+        }
+        .main-panel img { animation: apexAvatarBreath 4s ease-in-out infinite !important; border-radius: 10px !important; }
+        @keyframes apexAvatarBreath {
+            0%, 100% { transform: scale(1); }
+            50%      { transform: scale(1.015); }
+        }
+
+        .server-table {
+            contain: paint !important;
+            background: linear-gradient(180deg, rgba(14, 7, 28, 0.50), rgba(6, 3, 14, 0.38)) !important;
+            border: 1px solid var(--apex-line) !important;
+            border-top: 1px solid var(--apex-line-hot) !important;
+            border-radius: 12px !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05) !important;
+        }
+        .server-table tr.selected, .server-table tr.active, .server-table tr.is-active,
+        .server-table tr.is-selected, .server-table tr.current, .server-table tr.highlighted,
+        .server-table tr.row-selected, .server-table tr.active-row, .server-table tr.selected-row,
+        .server-table tr[aria-selected="true"], .server-table tr[data-selected="true"] {
+            background: linear-gradient(90deg, rgba(58, 28, 113, 0.5), rgba(138, 43, 226, 0.5), rgba(215, 109, 119, 0.3)) !important;
+            box-shadow: inset 2px 0 0 var(--apex-v3) !important;
+            color: #fff !important;
+        }
+        .server-table tr.selected td, .server-table tr.active td, .server-table tr.is-active td,
+        .server-table tr.is-selected td, .server-table tr.current td, .server-table tr.highlighted td,
+        .server-table tr.row-selected td, .server-table tr.active-row td, .server-table tr.selected-row td,
+        .server-table tr[aria-selected="true"] td, .server-table tr[data-selected="true"] td {
+            background: transparent !important; color: #fff !important;
+        }
+
+        .apex-portal-label {
+            display: inline-block !important;
+            background: linear-gradient(90deg, var(--apex-v1), var(--apex-v2), var(--apex-v3), var(--apex-v2), var(--apex-v1)) !important;
+            background-size: 200% 100% !important;
+            -webkit-background-clip: text !important; background-clip: text !important;
+            color: transparent !important; -webkit-text-fill-color: transparent !important;
+            font-weight: 700 !important;
+            animation: nebulaMove 6s linear infinite, apexPortalAura 2s ease-in-out infinite !important;
+        }
+        @keyframes apexPortalAura {
+            0%, 100% { text-shadow: 0 0 10px rgba(138, 43, 226, 0.5),  0 0 20px rgba(215, 109, 119, 0.25); }
+            50%      { text-shadow: 0 0 18px rgba(138, 43, 226, 0.85), 0 0 34px rgba(215, 109, 119, 0.5); }
+        }
+
+        #main-left-ad, #main-right-ad, #main-bottom-ad, #chat-container-ads, #main-bottom,
+        .ad-container, #ad-container, .advertisement, #ad-block, .adblock-container,
+        #onesignal-bell-container, .main-bottom-links, .social-media-box, .bottom-right-panel,
+        [id^="div-gpt-ad"], [id^="google_ads"], [id*="-ad-container"] {
+            display: none !important; width: 0 !important; height: 0 !important;
+            pointer-events: none !important; opacity: 0 !important;
+        }
+
+        .apex-linesplit-fixed {
+            display: inline-flex !important; align-items: center !important; justify-content: center !important;
+            background: rgba(6, 2, 14, 0.55) !important;
+            border: 1px solid rgba(0, 255, 255, 0.35) !important;
+            box-shadow: inset 0 1px 0 rgba(0,255,255,0.12) !important;
+            border-radius: 9px !important; padding: 7px 15px !important;
+            color: #0ff !important; font-size: 15px !important;
+            font-family: 'Karla', sans-serif !important; font-weight: 700 !important;
+            letter-spacing: 2px !important; text-transform: uppercase !important;
+            animation: apexPulseCyan 1.5s infinite alternate !important;
+            white-space: nowrap !important; z-index: 9999 !important;
+            text-shadow: 0 0 8px rgba(0,255,255,0.6), 0 1px 3px rgba(0,0,0,0.9) !important;
+        }
+        .apex-linesplit-fixed[style*="display: none"],
+        .apex-linesplit-fixed[style*="display:none"],
+        .apex-linesplit-fixed.hidden { display: none !important; }
+        .apex-linesplit-fixed::before {
+            content: ''; display: inline-block; width: 20px; height: 20px; margin-right: 8px;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300ffff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='12' y1='8' x2='12' y2='16'/%3E%3Cline x1='8' y1='12' x2='16' y2='12'/%3E%3C/svg%3E");
+            background-size: cover;
+            animation: apexPulseIcon 1.5s infinite alternate !important;
+        }
+        .apex-linesplit-fixed::after { content: 'LINE SPLIT'; }
+        @keyframes apexPulseCyan {
+            0%   { box-shadow: inset 0 1px 0 rgba(0,255,255,0.10); border-color: rgba(0,255,255,0.28); }
+            100% { box-shadow: inset 0 1px 0 rgba(0,255,255,0.22); border-color: rgba(0,255,255,0.7); }
+        }
+        @keyframes apexPulseIcon {
+            0%   { transform: scale(0.95); opacity: 0.8; }
+            100% { transform: scale(1.1);  opacity: 1; }
+        }
+
+        .apex-timer-container, .apex-timer-container * { border: none !important; }
+        .apex-timer-container {
+            background: rgba(8, 4, 18, 0.50) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+            border-radius: 9px !important; padding: 7px 16px !important;
+            color: #fff !important; font-size: 16px !important;
+            font-family: 'Karla', sans-serif !important; font-weight: 700 !important;
+            letter-spacing: 1.5px !important;
+            display: inline-flex !important; align-items: center !important; justify-content: center !important;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            z-index: 9999 !important;
+            text-shadow: 0 0 5px rgba(255,255,255,0.4), 0 1px 3px rgba(0,0,0,0.9) !important;
+        }
+        .apex-timer-container[style*="display: none"],
+        .apex-timer-container[style*="display:none"],
+        .apex-timer-container.hidden { display: none !important; }
+        .apex-timer-container:hover {
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.12) !important;
+            transform: translateY(-2px);
+        }
+        .apex-timer-icon-fixed {
+            display: inline-block !important; width: 20px !important; height: 20px !important;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23d76d77' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3C/svg%3E") !important;
+            background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important;
+            color: transparent !important; font-size: 0 !important;
+            animation: apexSpin 2.5s linear infinite !important; margin-right: 10px !important;
+        }
+        .apex-timer-no-i-tag::before {
+            content: ''; display: inline-block !important; width: 20px !important; height: 20px !important;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23d76d77' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8'/%3E%3Cpath d='M21 3v5h-5'/%3E%3C/svg%3E") !important;
+            background-size: cover !important; background-position: center !important;
+            animation: apexSpin 2.5s linear infinite !important; margin-right: 10px !important;
+        }
+    `;
+
+    const perfStyle = _origCE('style');
+    perfStyle.id = '_apex_perf';
+    perfStyle.textContent = `
+        body { overscroll-behavior: none !important; }
+        canvas { image-rendering: auto !important; }
+
+        canvas {
+            touch-action: none !important;
+            -webkit-user-select: none !important; user-select: none !important;
+            outline: none !important;
+        }
+
+        .apex-timer-container, .apex-linesplit-fixed { contain: layout style !important; }
+        .xp-meter > span { contain: paint !important; }
+
+        #chat-container, #score-panel, #party-panel, #leaderboard-panel,
+        #minimap-panel, #minimap, .minimap, #mini-map, .mini-map {
+            contain: content !important;
+        }
+        .main-panel img + *, .server-table td:first-child { contain: paint !important; }
+
+        html.apex-in-game .xp-meter > span,
+        html.apex-in-game .xp-meter > span::before,
+        html.apex-in-game .apex-portal-label,
+        html.apex-in-game .main-panel img,
+        html.apex-in-game .main-panel button,
+        html.apex-in-game .main-panel .gota-btn,
+        html.apex-in-game .main-panel img + *,
+        html.apex-in-game .server-table td:first-child {
+            animation-play-state: paused !important;
+        }
+
+        #apex-bh-ring, #apex-bh-photon, #apex-bh-disk, #apex-bh-front { transform-box: view-box; transform-origin: 380px 210px; }
+        #apex-bh-glow   { animation: apexBHBreath 6s ease-in-out infinite; contain: paint !important; }
+        #apex-bh-ring   { animation: apexBHRing 4.5s ease-in-out infinite, apexBHSpinCW 42s linear infinite; contain: paint !important; }
+        #apex-bh-photon { animation: apexBHSpinCCW 26s linear infinite; }
+        #apex-bh-disk   { animation: apexBHDiskWave 9s ease-in-out infinite; contain: paint !important; }
+        #apex-bh-front  { animation: apexBHDiskWave 9s ease-in-out infinite; }
+        @keyframes apexBHBreath { 0%, 100% { opacity: 0.75; } 50% { opacity: 1; } }
+        @keyframes apexBHRing   { 0%, 100% { opacity: 0.88; } 50% { opacity: 1; } }
+        @keyframes apexBHSpinCW   { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes apexBHSpinCCW  { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
+        @keyframes apexBHDiskWave { 0%, 100% { transform: scale(1, 1); } 50% { transform: scale(1.015, 1.07); } }
+        @keyframes apexMenuIn {
+            0%   { opacity: 0; transform: translateY(8px) scale(0.98); }
+            100% { opacity: 1; transform: translateY(0)   scale(1); }
+        }
+
+        #apex-loader {
+            position: fixed !important; top: 0 !important; left: 0 !important;
+            width: 100vw !important; height: 100vh !important;
+            background:
+                radial-gradient(ellipse 70% 55% at 50% 50%, #140628 0%, #070214 45%, #020007 100%) !important;
+            z-index: 9999999 !important;
+            display: flex !important; flex-direction: column !important;
+            justify-content: center !important; align-items: center !important;
+            transition: opacity 0.6s ease, visibility 0.6s ease !important;
+            pointer-events: none !important; overflow: hidden !important;
+            contain: layout paint !important;
+        }
+        #apex-loader::before {
+            content: "" !important; position: absolute !important;
+            top: -50% !important; left: -50% !important;
+            width: 200% !important; height: 200% !important;
+            background-image:
+                radial-gradient(1.1px 1.1px at  40px  60px, rgba(255,255,255,0.95), rgba(0,0,0,0)),
+                radial-gradient(0.9px 0.9px at 130px 190px, rgba(255,210,240,0.75), rgba(0,0,0,0)),
+                radial-gradient(1.3px 1.3px at 210px  95px, rgba(255,255,255,0.85), rgba(0,0,0,0)),
+                radial-gradient(0.8px 0.8px at 290px 250px, rgba(200,180,255,0.70), rgba(0,0,0,0)),
+                radial-gradient(1.5px 1.5px at 355px  35px, rgba(255,255,255,0.90), rgba(0,0,0,0)),
+                radial-gradient(0.9px 0.9px at  75px 320px, rgba(255,160,220,0.65), rgba(0,0,0,0)),
+                radial-gradient(1.1px 1.1px at 175px 365px, rgba(255,255,255,0.80), rgba(0,0,0,0)),
+                radial-gradient(0.8px 0.8px at 330px 175px, rgba(190,170,255,0.60), rgba(0,0,0,0)) !important;
+            background-size: 400px 400px !important;
+            animation: spaceStars 260s linear infinite !important;
+            opacity: 0.55 !important; pointer-events: none !important;
+        }
+        #apex-loader::after {
+            content: "" !important; position: absolute !important;
+            width: 1100px !important; height: 1100px !important;
+            background: radial-gradient(circle,
+                rgba(255, 45, 149, 0.055) 0%,
+                rgba(138, 43, 226, 0.045) 30%,
+                rgba(91, 75, 214, 0.022) 55%,
+                rgba(0,0,0,0) 72%) !important;
+            animation: nebulaPulse 18s ease-in-out infinite alternate !important;
+            pointer-events: none !important;
+        }
+
+        .apex-loader-text {
+            margin-top: 10px !important; color: #f2ecff !important; font-size: 15px !important;
+            font-weight: 700 !important; letter-spacing: 9px !important; text-transform: uppercase !important;
+            text-indent: 9px !important;
+            text-shadow: 0 0 18px rgba(255, 45, 149, 0.35), 0 0 4px rgba(255,255,255,0.35) !important;
+            animation: apexPulse 2.6s ease-in-out infinite !important; z-index: 10 !important;
+        }
+
+        @keyframes spaceStars { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes nebulaPulse {
+            0%   { transform: scale(1)    translate(0, 0);      opacity: 0.5; }
+            50%  { transform: scale(1.25) translate(30px, -20px); opacity: 0.85; }
+            100% { transform: scale(1)    translate(-30px, 20px); opacity: 0.5; }
+        }
+        @keyframes apexSpin  { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        @keyframes apexPulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; transform: scale(1.05); } }
+    `;
+
+    const currentHead = D.head || D.documentElement;
+    if (currentHead) { currentHead.appendChild(sacredStyle); currentHead.appendChild(perfStyle); }
+    _sacredStyleEl = sacredStyle; _perfStyleEl = perfStyle;
+};
+
+if (_on('css')) _injectStyles();
+
+if (_OFF.has('anim') || _OFF.has('cursor')) {
+    try {
+        const s = _origCE('style'); s.id = '_apex_dbg';
+        s.textContent =
+            (_OFF.has('anim')   ? '*, *::before, *::after { animation: none !important; transition: none !important; }\n' : '') +
+            (_OFF.has('cursor') ? 'html, body, body * { cursor: auto !important; }\n' : '');
+        (D.head || D.documentElement).appendChild(s);
+    } catch (_) {}
+}
+
+const _ensureStyles = () => {
+    try {
+        if (_sacredStyleEl && !_sacredStyleEl.isConnected) {
+            const h = D.head || D.documentElement;
+            if (h) { h.appendChild(_sacredStyleEl); if (_perfStyleEl) h.appendChild(_perfStyleEl); }
+        }
+    } catch (_) {}
+};
+
+_aEL.call(D, 'DOMContentLoaded', () => {
+    try {
+        const h = D.head; if (!h) return;
+        const s = D.getElementById('_apex_sacred'), p = D.getElementById('_apex_perf'), f = D.getElementById('_apex_font');
+        if (s && s.parentNode !== h) h.appendChild(s);
+        if (p && p.parentNode !== h) h.appendChild(p);
+        if (f && f.parentNode !== h) h.insertBefore(f, h.firstChild);
+    } catch (_) {}
+}, OPT_O);
+
+const _initLoader = () => {
+    try {
+        const loader = _origCE('div'); loader.id = 'apex-loader';
+        loader.innerHTML = `
+<svg viewBox="0 0 760 420" width="640" height="354" style="overflow:visible" aria-hidden="true">
+  <defs>
+    <radialGradient id="apxHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#ff3d9a" stop-opacity="0.20"/>
+      <stop offset="30%"  stop-color="#c13ae0" stop-opacity="0.12"/>
+      <stop offset="62%"  stop-color="#6b2fc0" stop-opacity="0.045"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="apxDisk" gradientUnits="userSpaceOnUse" x1="140" y1="210" x2="620" y2="210">
+      <stop offset="0%"   stop-color="#331b6e" stop-opacity="0.15"/>
+      <stop offset="10%"  stop-color="#7d27a8" stop-opacity="0.65"/>
+      <stop offset="25%"  stop-color="#e02f8d"/>
+      <stop offset="40%"  stop-color="#ff4da6"/>
+      <stop offset="50%"  stop-color="#ff8ecb"/>
+      <stop offset="62%"  stop-color="#cf4fe8"/>
+      <stop offset="78%"  stop-color="#7b4ce2" stop-opacity="0.85"/>
+      <stop offset="92%"  stop-color="#3c2a96" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#241a5e" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <linearGradient id="apxRing" gradientUnits="userSpaceOnUse" x1="262" y1="210" x2="498" y2="210">
+      <stop offset="0%"   stop-color="#ff2d95"/>
+      <stop offset="30%"  stop-color="#ff62b8"/>
+      <stop offset="55%"  stop-color="#ffa6d8"/>
+      <stop offset="78%"  stop-color="#c45cf0"/>
+      <stop offset="100%" stop-color="#7d4ae6"/>
+    </linearGradient>
+
+    <linearGradient id="apxPhoton" gradientUnits="userSpaceOnUse" x1="290" y1="210" x2="470" y2="210">
+      <stop offset="0%"   stop-color="#ff9ad4" stop-opacity="0.85"/>
+      <stop offset="50%"  stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#b98cff" stop-opacity="0.85"/>
+    </linearGradient>
+
+    <clipPath id="apxLower"><rect x="0" y="212" width="760" height="208"/></clipPath>
+  </defs>
+
+  <circle id="apex-bh-glow" cx="380" cy="210" r="300" fill="url(#apxHalo)"/>
+
+  <g id="apex-bh-disk">
+    <ellipse cx="380" cy="210" rx="268" ry="17" fill="none" stroke="url(#apxDisk)" stroke-width="5"  opacity="0.30"/>
+    <ellipse cx="380" cy="210" rx="240" ry="27" fill="none" stroke="url(#apxDisk)" stroke-width="9"  opacity="0.55"/>
+    <ellipse cx="380" cy="210" rx="212" ry="34" fill="none" stroke="url(#apxDisk)" stroke-width="13" opacity="0.80"/>
+    <ellipse cx="380" cy="210" rx="186" ry="30" fill="none" stroke="url(#apxDisk)" stroke-width="10" opacity="0.95"/>
+    <ellipse cx="380" cy="210" rx="160" ry="23" fill="none" stroke="url(#apxDisk)" stroke-width="7"  opacity="0.75"/>
+  </g>
+
+  <circle cx="380" cy="210" r="70" fill="#040108"/>
+
+  <g id="apex-bh-ring">
+    <circle cx="380" cy="210" r="104" fill="none" stroke="url(#apxRing)" stroke-width="7"  opacity="0.35"/>
+    <circle cx="380" cy="210" r="94"  fill="none" stroke="url(#apxRing)" stroke-width="15" opacity="0.72"/>
+    <circle cx="380" cy="210" r="82"  fill="none" stroke="url(#apxRing)" stroke-width="11" opacity="0.95"/>
+  </g>
+
+  <g id="apex-bh-front" clip-path="url(#apxLower)">
+    <ellipse cx="380" cy="210" rx="212" ry="34" fill="none" stroke="url(#apxDisk)" stroke-width="13" opacity="0.92"/>
+    <ellipse cx="380" cy="210" rx="186" ry="30" fill="none" stroke="url(#apxDisk)" stroke-width="10" opacity="1"/>
+    <ellipse cx="380" cy="210" rx="160" ry="23" fill="none" stroke="url(#apxDisk)" stroke-width="7"  opacity="0.85"/>
+  </g>
+
+  <g id="apex-bh-photon">
+    <circle cx="380" cy="210" r="72" fill="none" stroke="url(#apxPhoton)" stroke-width="2.2" opacity="0.9"/>
+  </g>
+  <circle cx="380" cy="210" r="70" fill="none" stroke="#000" stroke-width="1" opacity="0.6"/>
+</svg>
+<div class="apex-loader-text" id="apex-loader-txt">INICIANDO...</div>`;
+        const attachLoader = () => { if (D.body) { D.body.appendChild(loader); } else { _rAF(attachLoader); } };
+        attachLoader();
+        let loaderTimeout;
+        const hideLoader = () => {
+            loader.style.opacity = '0';
+            loader.style.visibility = 'hidden';
+            setTimeout(() => { loader.style.display = 'none'; }, 600);
+        };
+        const showLoader = (text, duration) => {
+            const textElement = D.getElementById('apex-loader-txt');
+            if (textElement) textElement.innerText = text;
+            loader.style.display = 'flex';
+            setTimeout(() => { loader.style.opacity = '1'; loader.style.visibility = 'visible'; }, 10);
+            clearTimeout(loaderTimeout); if (duration) loaderTimeout = setTimeout(hideLoader, duration);
+        };
+        setTimeout(hideLoader, 2500);
+        return { show: showLoader };
+    } catch (_) { return null; }
+};
+if (_on('intro')) _loader = _initLoader();
+
+let _chatEl = null, _chatNext = 0;
+const _getChat = () => {
+    if (_chatEl && _chatEl.isConnected) return _chatEl;
+    const now = _pNow();
+    if (now < _chatNext) return null;
+    _chatNext = now + 1000;
+    try {
+        _chatEl = D.getElementById('chat-container') ||
+                  D.querySelector('#chat, .chat-container, #chat-messages, .chat-messages');
+    } catch (_) { _chatEl = null; }
+    return _chatEl;
+};
+const _chatLike = (el) => {
+    const id = el.id;
+    if (id && id.indexOf('chat') !== -1) return true;
+    const c = el.className;
+    return typeof c === 'string' && c.indexOf('chat') !== -1;
+};
+
+const _sanitizeInput = el => {
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+        const type = el.type;
+        if (type !== 'password' && type !== 'hidden') {
+            el.setAttribute('spellcheck', 'false');
+            el.setAttribute('autocomplete', 'off');
+            el.setAttribute('autocorrect', 'off');
+            el.setAttribute('autocapitalize', 'off');
+        }
+    }
+};
+const _sanitizeAll = () => {
+    try {
+        const els = D.querySelectorAll('input:not([data-gfs]), textarea:not([data-gfs])');
+        for (let i = 0; i < els.length; i++) { _sanitizeInput(els[i]); els[i].setAttribute('data-gfs', '1'); }
+    } catch (_) {}
+};
+
+const _nukeAdPanels = () => {
+    try {
+        const adNodes = D.querySelectorAll(_AD_SEL);
+        let i = adNodes.length;
+        while (i--) { try { _elRemove.call(adNodes[i]); } catch (_) {} }
+        const containers = D.querySelectorAll('#main-left > div, #main-right > div, .main-panel');
+        i = containers.length; let el;
+        while (i--) {
+            el = containers[i];
+            if (!el || el.id === 'profile-panel' || el.id === 'leaderboard-panel' || el.id === 'party-panel') continue;
+            if (_isAdPlaceholderText(el.textContent || '')) el.style.setProperty('display', 'none', 'important');
+        }
+    } catch (_) {}
+};
+
+const _beautifyWatched = new Map();
+const _watchBeautifyNode = (node) => {
+    if (_beautifyWatched.has(node)) return;
+    try {
+        const obs = new MutationObserver(() => { if (node.isConnected) _processTextNode(node); });
+        obs.observe(node, { characterData: true });
+        _beautifyWatched.set(node, obs);
+    } catch (_) {}
+};
+const _pruneWatchers = () => {
+    _beautifyWatched.forEach((obs, node) => {
+        if (!node.isConnected) { obs.disconnect(); _beautifyWatched.delete(node); }
+    });
+};
+
+const _closestMainPanel = (el) => {
+    while (el && el !== D.body) {
+        if (el.classList && el.classList.contains('main-panel')) return el;
+        el = el.parentElement;
+    }
+    return null;
+};
+
+let _apexProfilePanel = null;
+let _apexBuildPanel = null;
+let _apexMenuAssembled = false;
+let _apexMenuWrapper = null;
+const _tryAssembleMenuLayout = () => {
+    if (_apexMenuAssembled || !_apexProfilePanel || !_apexBuildPanel) return;
+    const buildParent = _apexBuildPanel.parentElement;
+    if (!buildParent) return;
+    _apexMenuAssembled = true;
+
+    const profileOldParent = _apexProfilePanel.parentElement;
+
+    const wrapper = _origCE('div');
+    wrapper.className = 'apex-left-col';
+    buildParent.insertBefore(wrapper, _apexBuildPanel);
+    wrapper.appendChild(_apexProfilePanel);
+    wrapper.appendChild(_apexBuildPanel);
+    _apexMenuWrapper = wrapper;
+
+    if (profileOldParent && profileOldParent !== buildParent && profileOldParent !== wrapper && profileOldParent.children.length === 0) {
+        profileOldParent.style.setProperty('display', 'none', 'important');
+    }
+};
+
+let _apexOptionsBtn = null, _apexHotkeysBtn = null, _apexThemeBtn = null, _apexCellPanelBtn = null;
+let _apexExtraGridAssembled = false;
+const _tryAssembleExtraGrid = () => {
+    if (_apexExtraGridAssembled) return;
+    if (!_apexOptionsBtn || !_apexHotkeysBtn || !_apexThemeBtn || !_apexCellPanelBtn) return;
+    const anchorParent = _apexOptionsBtn.parentElement;
+    if (!anchorParent) return;
+    _apexExtraGridAssembled = true;
+
+    const btns = [_apexOptionsBtn, _apexHotkeysBtn, _apexThemeBtn, _apexCellPanelBtn];
+    const oldParents = btns.map(b => b.parentElement);
+
+    const wrapper = _origCE('div');
+    wrapper.className = 'apex-extra-grid';
+    anchorParent.insertBefore(wrapper, _apexOptionsBtn);
+    btns.forEach(b => wrapper.appendChild(b));
+
+    oldParents.forEach(p => {
+        if (p && p !== wrapper && p !== anchorParent && p.isConnected && p.children.length === 0) {
+            p.style.setProperty('display', 'none', 'important');
+        }
+    });
+};
+
+const _processTextNode = (node) => {
+    const val = node.nodeValue;
+    if (!val) return;
+
+    if (val.includes('arrow_range')) {
+        const parent = node.parentElement;
+        if (parent && !parent.classList.contains('apex-linesplit-fixed')) {
+            parent.classList.add('apex-linesplit-fixed');
+            node.nodeValue = val.replace('arrow_range', '');
+            parent.style.color = '';
+            parent.style.border = '';
+            parent.style.background = '';
+        } else if (parent) {
+            node.nodeValue = val.replace('arrow_range', '');
+        }
+        _watchBeautifyNode(node);
+        return;
+    }
+    if (val.includes('refresh')) {
+        const parent = node.parentElement;
+        if (parent && !parent.classList.contains('apex-timer-icon-fixed') && !parent.classList.contains('apex-timer-container')) {
+            if (parent.tagName === 'I' || parent.classList.contains('material-icons')) {
+                parent.classList.add('apex-timer-icon-fixed');
+                node.nodeValue = val.replace('refresh', '');
+
+                let container = parent.parentElement;
+                if (container && container.tagName === 'SPAN') container = container.parentElement;
+                if (container && container !== D.body) {
+                    container.classList.add('apex-timer-container');
+                    container.style.background = '';
+                    container.style.border = '';
+                    container.style.boxShadow = '';
+                }
+            } else {
+                parent.classList.add('apex-timer-container');
+                parent.classList.add('apex-timer-no-i-tag');
+                node.nodeValue = val.replace('refresh', '');
+            }
+        } else if (parent && (parent.classList.contains('apex-timer-icon-fixed') || parent.classList.contains('apex-timer-container'))) {
+            node.nodeValue = val.replace('refresh', '');
+        }
+        _watchBeautifyNode(node);
+        return;
+    }
+    if (val.includes('Camlan Build')) {
+        node.nodeValue = val.replace('Camlan Build', 'Funkiid Build');
+        return;
+    }
+
+    if (val.length > 24) return;
+    const trimmed = val.trim();
+
+    switch (trimmed) {
+        case 'Servers': {
+            const btn = node.parentElement;
+            if (btn && !btn.classList.contains('apex-portal-btn')) {
+                btn.classList.add('apex-portal-btn');
+                node.nodeValue = '';
+                const label = _origCE('span');
+                label.className = 'apex-portal-label';
+                label.textContent = 'Servidores';
+                btn.appendChild(label);
+            }
+            break;
+        }
+        case 'Play': {
+            const btn = node.parentElement;
+            const container = btn && btn.parentElement;
+            if (container && !container.classList.contains('apex-menu-grid')) container.classList.add('apex-menu-grid');
+            if (btn && !btn.classList.contains('apex-full-row')) btn.classList.add('apex-full-row');
+            const panel = _closestMainPanel(container);
+            if (panel && panel.parentElement && !panel.parentElement.classList.contains('apex-menu-row')) {
+                panel.parentElement.classList.add('apex-menu-row');
+            }
+            if (panel && !_apexBuildPanel) { _apexBuildPanel = panel; _tryAssembleMenuLayout(); }
+            break;
+        }
+        case 'Spectate': {
+            const btn = node.parentElement;
+            if (btn && !btn.classList.contains('apex-full-row')) btn.classList.add('apex-full-row');
+            break;
+        }
+        case 'Options':    { const b = node.parentElement; if (b && !_apexOptionsBtn)   { _apexOptionsBtn = b;   _tryAssembleExtraGrid(); } break; }
+        case 'Hotkeys':    { const b = node.parentElement; if (b && !_apexHotkeysBtn)   { _apexHotkeysBtn = b;   _tryAssembleExtraGrid(); } break; }
+        case 'Theme':      { const b = node.parentElement; if (b && !_apexThemeBtn)     { _apexThemeBtn = b;     _tryAssembleExtraGrid(); } break; }
+        case 'Cell Panel': { const b = node.parentElement; if (b && !_apexCellPanelBtn) { _apexCellPanelBtn = b; _tryAssembleExtraGrid(); } break; }
+        case 'Logout': {
+            const panel = _closestMainPanel(node.parentElement);
+            if (panel && panel.parentElement && !panel.parentElement.classList.contains('apex-menu-row')) {
+                panel.parentElement.classList.add('apex-menu-row');
+            }
+            if (panel && !_apexProfilePanel) { _apexProfilePanel = panel; _tryAssembleMenuLayout(); }
+            break;
+        }
+        case 'Expand all': {
+            const panel = _closestMainPanel(node.parentElement);
+            if (panel && panel.parentElement && !panel.parentElement.classList.contains('apex-menu-row')) {
+                panel.parentElement.classList.add('apex-menu-row');
+            }
+            break;
+        }
+    }
+};
+
+const _walkFilter = {
+    acceptNode(n) {
+        if (n.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
+        const tag = n.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg') return NodeFilter.FILTER_REJECT;
+        if (_chatLike(n)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_SKIP;
+    }
+};
+
+let _sweepWalker = null, _sweepAccum = 0;
+const _SWEEP_CHUNK = 300;
+const _SWEEP_CHECK_EVERY = 30;
+
+const _sweepStep = (deadline) => {
+    if (!_sweepWalker) return;
+    try {
+        const t0 = _pNow();
+        const canDeadline = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout;
+        let n, processed = 0, check = 0, exhausted = false;
+        while (true) {
+            n = _sweepWalker.nextNode();
+            if (!n) { exhausted = true; break; }
+            if (n.nodeType === 3) _processTextNode(n);
+            processed++;
+            if (++check >= _SWEEP_CHECK_EVERY) {
+                check = 0;
+                if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break;
+            }
+            if (processed >= _SWEEP_CHUNK) break;
+        }
+        _sweepAccum += _pNow() - t0;
+        if (exhausted) {
+            _sweepWalker = null;
+            try { _sanitizeAll(); } catch (_) {}
+            STAT.sweeps++; STAT.sweepMs += _sweepAccum; if (_sweepAccum > STAT.sweepMaxMs) STAT.sweepMaxMs = _sweepAccum;
+            _sweepAccum = 0;
+        } else {
+            _idle(_sweepStep, 500);
+        }
+    } catch (_) {
+        _sweepWalker = null; _sweepAccum = 0;
+    }
+};
+
+const _sweepAll = (deadline) => {
+    try {
+        _ensureStyles();
+        _pruneWatchers();
+        if (!D.body || _sweepWalker) return;
+        _sweepAccum = 0;
+        _sweepWalker = D.createTreeWalker(D.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
+        _sweepStep(deadline || {});
+    } catch (_) { _sweepWalker = null; }
+};
+const _sweepSoon = (ms) => { if (_on('dom')) _st(() => _idle(_sweepAll, 500), ms); };
+
+// v7.2.0: RENDIMIENTO EN SESIONES LARGAS -- el barrido ante mutaciones ya no
+// recorre todo el `body`. Antes, cualquier mutación fuera del chat disparaba
+// _sweepAll() completo (en lotes, así que nunca bloqueaba el hilo, pero su
+// costo TOTAL por barrido crecía con la cantidad de nodos del documento --
+// y esa cantidad solo puede subir con las horas). Ahora _moCb encola los
+// NODOS AGREGADOS de cada tanda de mutación (no el contenedor que cambió) y
+// el flush escanea solo esos nodos y sus subárboles. El costo por flush
+// queda atado a lo que cambió, no al tamaño total del DOM. Si la cola se
+// desborda (250 raíces en una sola tanda -- indicio de un remount grande,
+// tipo cambio de servidor), cae UNA VEZ a un barrido completo como red de
+// seguridad, reusando la misma infraestructura chunked de siempre
+// (_sweepAll/_sweepWalker/_sweepStep, sin tocar).
+let _sweepQueue = [];
+let _sweepQueueSet = new Set();
+let _forcedFullSweep = false;
+const _SWEEP_QUEUE_CAP = 250;
+
+const _queueSweepRoot = (node, chat) => {
+    if (!node || _sweepQueueSet.has(node)) return;
+    if (node.nodeType === 1) {
+        const tag = node.tagName;
+        // Mismo criterio que _walkFilter -- sin sentido encolar una raíz que
+        // el propio filtro rechazaría igual al caminarla.
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg') return;
+        // El filtro de la raíz que se le pasa a createTreeWalker() nunca se
+        // evalúa a sí misma -- solo rechaza lo que encuentra POR DEBAJO. Si
+        // se encolara el contenedor de chat directo como raíz, un walker
+        // enraizado ahí recorrería todo su historial igual (sus hijos no
+        // tienen "chat" en su propio id/clase). Por eso el chequeo va acá,
+        // antes de encolar, no solo dentro del walker.
+        if (_chatLike(node)) return;
+    } else if (node.nodeType !== 3) {
+        return;
+    }
+    if (chat && chat.contains(node)) return;
+    _sweepQueueSet.add(node);
+    _sweepQueue.push(node);
+    if (_sweepQueue.length > _SWEEP_QUEUE_CAP) {
+        _sweepQueue = [];
+        _sweepQueueSet = new Set();
+        _forcedFullSweep = true;
+    }
+};
+
+let _queueWalker = null, _queueAccum = 0;
+const _flushQueueStep = (deadline) => {
+    try {
+        const t0 = _pNow();
+        const canDeadline = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout;
+        let processed = 0, check = 0;
+
+        outer:
+        while (true) {
+            if (!_queueWalker) {
+                let root;
+                do {
+                    root = _sweepQueue.length ? _sweepQueue.shift() : undefined;
+                    if (root !== undefined) _sweepQueueSet.delete(root);
+                } while (root !== undefined && !root.isConnected);
+                if (root === undefined) break; // cola vacía -- terminado
+
+                if (root.nodeType === 3) {
+                    _processTextNode(root);
+                    processed++;
+                    if (++check >= _SWEEP_CHECK_EVERY) {
+                        check = 0;
+                        if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break outer;
+                    }
+                    if (processed >= _SWEEP_CHUNK) break outer;
+                    continue;
+                }
+                _queueWalker = D.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
+            }
+
+            const n = _queueWalker.nextNode();
+            if (!n) { _queueWalker = null; continue; }
+            if (n.nodeType === 3) _processTextNode(n);
+            processed++;
+            if (++check >= _SWEEP_CHECK_EVERY) {
+                check = 0;
+                if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break;
+            }
+            if (processed >= _SWEEP_CHUNK) break;
+        }
+
+        _queueAccum += _pNow() - t0;
+
+        if (_queueWalker || _sweepQueue.length) {
+            _idle(_flushQueueStep, 500);
+        } else {
+            try { _sanitizeAll(); } catch (_) {}
+            STAT.sweeps++; STAT.sweepMs += _queueAccum; if (_queueAccum > STAT.sweepMaxMs) STAT.sweepMaxMs = _queueAccum;
+            _queueAccum = 0;
+        }
+    } catch (_) {
+        _queueWalker = null; _queueAccum = 0; _sweepQueue = []; _sweepQueueSet = new Set();
+    }
+};
+
+let _flushTimer = 0;
+const _flush = () => {
+    _flushTimer = 0;
+    if (_tabHidden) return; // se recupera al volver: _onRealVisibility llama _sweepSoon(200)
+    if (_forcedFullSweep) {
+        _forcedFullSweep = false;
+        _sweepQueue = []; _sweepQueueSet = new Set();
+        STAT.flushes++;
+        _idle(_sweepAll, 500);
+        return;
+    }
+    if (!_sweepQueue.length) return;
+    STAT.flushes++;
+    _idle(_flushQueueStep, 500);
+};
+const _moCb = (recs) => {
+    const chat = _getChat();
+    for (let i = 0; i < recs.length; i++) {
+        const rec = recs[i];
+        if (chat && chat.contains(rec.target)) continue;
+        const added = rec.addedNodes;
+        for (let j = 0; j < added.length; j++) _queueSweepRoot(added[j], chat);
+    }
+    if ((_sweepQueue.length || _forcedFullSweep) && !_flushTimer) {
+        _flushTimer = _st(_flush, _inGame ? 4000 : 300);
+    }
+};
+
+const _isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    if (typeof el.checkVisibility === 'function') {
+        try { return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }); } catch (_) {}
+    }
+    if (el.offsetParent === null) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+};
+
+const _setInGame = (v) => {
+    if (v === _inGame) return;
+    _inGame = v;
+    try { D.documentElement.classList.toggle('apex-in-game', v); } catch (_) {}
+    if (!v) _sweepSoon(50);
+};
+
+const _handleJoin = () => {
+    if (_isNewServer && _loader) _loader.show('CONECTANDO...', 1500);
+    _isNewServer = false;
+    _joinGraceUntil = _pNow() + 3000;
+    _setInGame(true);
+    try {
+        const a = D.activeElement;
+        if (a && (a.tagName === 'BUTTON' || a.tagName === 'A')) a.blur();
+    } catch (_) {}
+    _sweepSoon(300); _sweepSoon(1500); _sweepSoon(4000);
+};
+{
+    const _onMenuClick = (e) => {
+        if (_inGame) return;
+        if (e.target.closest('#btn-play, .play-btn, button[id*="play" i], button[class*="play" i]')) _handleJoin();
+    };
+    const _onMenuKeydown = (e) => {
+        if (e.key !== 'Enter') return;
+        const activeTag = D.activeElement ? D.activeElement.tagName.toLowerCase() : '';
+        if (activeTag !== 'input' && activeTag !== 'textarea') _handleJoin();
+    };
+    const _onMenuDblClick = (e) => {
+        if (_inGame) return;
+        if (e.target.closest('.server-table tr, .server-row, #server-list tr')) _st(_handleJoin, 50);
+    };
+    _aEL.call(D, 'click',    _onMenuClick,    OPT_P);
+    _aEL.call(D, 'keydown',  _onMenuKeydown,  OPT_P);
+    _aEL.call(D, 'dblclick', _onMenuDblClick, OPT_P);
+}
+
+if (_on('dom')) {
+    try { new MutationObserver(_moCb).observe(D, { childList: true, subtree: true }); } catch (_) {}
+
+    const _initSweeps = () => { _nukeAdPanels(); _sweepAll(); };
+    _aEL.call(D, 'DOMContentLoaded', _initSweeps, OPT_O);
+    try { _aEL.call(W, 'load', _initSweeps, OPT_O); } catch (_) {}
+    _st(_initSweeps, 1200);
+    _st(_initSweeps, 3500);
+    _st(_initSweeps, 8000);
+
+    _si(() => {
+        if (_tabHidden || _pNow() < _joinGraceUntil) return;
+        const menuVisible = _apexMenuWrapper
+            ? _isVisible(_apexMenuWrapper)
+            : (_isVisible(_apexBuildPanel) || _isVisible(_apexProfilePanel));
+        if (!_apexMenuWrapper && !_apexBuildPanel && !_apexProfilePanel) return;
+        _setInGame(!menuVisible);
+    }, 1000);
+}
+
+try {
+    Object.defineProperty(W, '__GOTA_FUN__', {
+        value: Object.freeze({
+            version: SCRIPT_VERSION,
+            basedOn: '101.10.0',
+            mode: DEBUG ? 'debug' : 'prod',
+            off: Array.from(_OFF),
+            loadedAt: Date.now(),
+            readyStateAtLoad: D.readyState,
+        }),
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
+} catch (_) {}
+try {
+    if (D.documentElement) D.documentElement.dataset.gotaFunVersion = SCRIPT_VERSION;
+} catch (_) {}
+
+})();
