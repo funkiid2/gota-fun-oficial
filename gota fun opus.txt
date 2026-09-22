@@ -7,8 +7,8 @@
 // v7.0.0: REMAKE.
 // v6.0.0 (reimaginado): núcleo mínimo + interruptores de diagnóstico.
 // @author       funkiid
-// @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
-// @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
+// @updateURL   https://github.com
+// @downloadURL https://github.com
 // @icon         https://cdn.shopify.com/s/files/1/0125/8261/7145/files/BOYFRIEND_PLUSH_TOY-SV4-P-1_1000x.png.webp?v=1726159538
 // @match        https://gota.io/web/*
 // @match        https://play.gota.io/*
