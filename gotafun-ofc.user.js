@@ -1,14 +1,11 @@
 // ==UserScript==
 // @name         gota fun v2
 // @namespace    http://tampermonkey.net/
-// @version      7.2.0
-// @description  v7.2.0: Rendimiento en sesiones largas -- el barrido ante mutaciones ya no recorre todo el `body`. Antes, cualquier mutación fuera del chat disparaba _sweepAll() completo (en lotes, así que nunca bloqueaba, pero su costo total crecía con la cantidad de nodos del documento -- y esa cantidad solo puede subir con las horas). Ahora _moCb encola los nodos agregados de cada tanda y el flush escanea solo esos nodos y sus subárboles; el costo por flush queda atado a lo que cambió, no al tamaño total del DOM. Si la cola se desborda (250 raíces en una sola tanda), cae una vez a un barrido completo como red de seguridad, con la misma infraestructura chunked de siempre. Input: el foco del canvas se reenganchaba solo en mousedown -- se agregó pointerdown (se dispara antes en el orden de eventos del spec), adelantando el .focus() del canvas unos milisegundos respecto al mismo click real; mismo throttle de 500ms compartido, mismo elemento, sin capturar posición ni movimiento nuevo. Rendimiento menor: se sacó un cv.style.setProperty('outline', 'none') redundante en cada hookup de canvas -- la hoja _apex_perf ya cubre `canvas { outline: none !important; }` para todos los canvas desde v6.0.0.
-//
-// v7.0.0: REMAKE.
-// v6.0.0 (reimaginado): núcleo mínimo + interruptores de diagnóstico.
+// @version      7.13.0
+// @description  v7.13.0: dos mejoras chicas, ambas contra costos de repintado/filtrado innecesarios. (1) FIX -- _getHudPanels() confiaba en su caché de 1s sin revalidar isConnected, a diferencia de _getChat() (que sí lo hace). Si Gota reemplaza el CONTENEDOR entero de uno de los 4 paneles (leaderboard/score/party/minimap) dentro de esa ventana, la referencia cacheada queda apuntando a un nodo desconectado -- .contains() sobre ese nodo nunca ve el panel nuevo y en vivo, así que el filtro de exclusión de v7.5.0 deja de aplicar en silencio durante esa ventana (los mismos reordenamientos del leaderboard que causaban el lag original podían volver a colarse, de forma intermitente). Ahora se revalida isConnected en los 4 antes de confiar en la caché, mismo patrón que _getChat. (2) RENDIMIENTO -- .apex-portal-label (la etiqueta "Servidores") anima background-position (nebulaMove) Y text-shadow (apexPortalAura) -- ninguna de las dos es compositor-only, ambas fuerzan repintado -- sin ningún contain en absoluto. El resto de elementos con la misma animación de gradiente (.xp-meter > span, .main-panel img + *, .server-table td:first-child) ya tienen contain:paint en _apex_perf para acotar ese repintado a su propia caja; a este se le había pasado por alto. Se agrega ahí mismo -- es un <span> sin hijos ni overflow intencional, sin riesgo visual. Deliberadamente NO se tocó .main-panel button/.gota-btn (comparten la misma animación): .apex-menu-grid > * les fija overflow:visible !important a propósito, y agregar contain:paint ahí podría recortar algo que hoy se deja desbordar sin poder verificar el resultado visual desde acá.
 // @author       funkiid
-// @updateURL    https://github.com/funkiid2/gota-fun-oficial/raw/refs/heads/main/gota-fun.user.js
-// @downloadURL  https://github.com/funkiid2/gota-fun-oficial/raw/refs/heads/main/gota-fun.user.js
+// @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
+// @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
 // @icon         https://cdn.shopify.com/s/files/1/0125/8261/7145/files/BOYFRIEND_PLUSH_TOY-SV4-P-1_1000x.png.webp?v=1726159538
 // @match        https://gota.io/web/*
 // @match        https://play.gota.io/*
@@ -22,7 +19,7 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '7.2.0';
+const SCRIPT_VERSION = '7.13.0';
 const W = window, D = document;
 
 const RENDER_SCALE = 1.0;
@@ -91,7 +88,7 @@ let _tabHidden = _getRealHidden();
 let _inGame = false;
 let _isNewServer = true;
 let _lastWSOrigin = null;
-let _gameCanvas = null, _cvFocusTs = 0;
+let _gameCanvas = null;
 let _inTextField = false;
 let _joinGraceUntil = 0;
 let _sacredStyleEl = null, _perfStyleEl = null;
@@ -354,7 +351,8 @@ if (_on('net')) {
             } catch (_) {}
         };
         _wipeStorage();
-        _si(_wipeStorage, 120000);
+        const _wipeStorageLoop = () => { _wipeStorage(); _st(() => _idle(_wipeStorageLoop, 2000), 300000); };
+        _st(() => _idle(_wipeStorageLoop, 2000), 300000);
     } catch (_) {}
 
     try {
@@ -511,32 +509,14 @@ if (_RS_ACTIVE) {
 
 const _setupGameCanvasFocus = (cv) => {
     try {
-        // v7.2.0: se sacó el cv.style.setProperty('outline', 'none', ...)
-        // de acá -- rendimiento pequeño, pero real. La hoja _apex_perf ya
-        // tiene `canvas { outline: none !important; }` para TODOS los
-        // canvas de la página (sección de estilos, más abajo) desde el
-        // rewrite de v6.0.0 -- esta línea era una escritura de estilo
-        // inline redundante en cada hookup de canvas, disparando una
-        // invalidación de estilo por algo que el CSS ya cubría sin ella.
         cv.tabIndex = -1; cv.focus({ preventScroll: true });
-        const _refocus = () => {
-            const n = _pNow(); if (n - _cvFocusTs > 500) { _cvFocusTs = n; cv.focus({ preventScroll: true }); }
-        };
-        // v7.2.0 -- INPUT: pointerdown además de mousedown. pointerdown se
-        // dispara ANTES que mousedown en el orden de eventos del spec
-        // (PointerEvent primero; el mismo click dispara después el
-        // MouseEvent legacy) -- agregarlo adelanta el refoco del canvas
-        // unos milisegundos respecto al mismo click real. _cvFocusTs es
-        // compartido entre los dos listeners: pointerdown hace el refoco y
-        // marca el timestamp; mousedown, milisegundos después, ya lo
-        // encuentra dentro de la ventana de 500ms y no hace nada -- mismo
-        // throttle, mismo elemento, sin capturar posición ni movimiento
-        // nuevo, es la misma lógica de siempre enganchada a un evento que
-        // llega antes.
+        const _refocus = () => { if (D.activeElement !== cv) cv.focus({ preventScroll: true }); };
         _aEL.call(cv, 'pointerdown', _refocus, OPT_P);
         _aEL.call(cv, 'mousedown', _refocus, OPT_P);
     } catch (_) {}
 };
+
+const _isThrowawayCanvas = (cv) => cv.width <= 1 || cv.height <= 1;
 
 if (_on('canvas')) {
     try {
@@ -544,6 +524,7 @@ if (_on('canvas')) {
         HTMLCanvasElement.prototype.getContext = function (type, attrs) {
             if (type === '2d') {
                 if (this._apexCtx2dDone) return _origGetCtx.call(this, type, attrs);
+                if (_isThrowawayCanvas(this)) return _origGetCtx.call(this, type, attrs);
                 this._apexCtx2dDone = true;
                 const a = attrs ? Object.assign({}, attrs) : {};
                 if (a.alpha == null) a.alpha = true;
@@ -558,6 +539,7 @@ if (_on('canvas')) {
             }
             if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
                 if (this._apexCtxDone) return _origGetCtx.call(this, type, attrs);
+                if (_isThrowawayCanvas(this)) return _origGetCtx.call(this, type, attrs);
                 const a = attrs ? Object.assign({}, attrs) : {};
                 if (a.powerPreference == null) a.powerPreference = 'high-performance';
                 a.desynchronized = false;
@@ -577,6 +559,7 @@ if (_on('canvas')) {
             }
             if (type === 'webgpu') {
                 if (this._apexCtxDone) return _origGetCtx.call(this, type, attrs);
+                if (_isThrowawayCanvas(this)) return _origGetCtx.call(this, type, attrs);
                 const ctx = _origGetCtx.call(this, type, attrs);
                 if (!ctx) return ctx;
                 this._apexCtxDone = true;
@@ -652,7 +635,14 @@ if (_on('tab')) {
     _aEL.call(D, 'visibilitychange', _onRealVisibility, true);
 
     _aEL.call(D, 'DOMContentLoaded', _acqWL, OPT_O);
-    try { _aEL.call(W, 'focus', () => { if (!_wakelock) _acqWL(); }, OPT_P); } catch (_) {}
+    try {
+        _aEL.call(W, 'focus', () => {
+            if (!_wakelock) _acqWL();
+            if (_gameCanvas && !_inTextField) {
+                try { _gameCanvas.focus({ preventScroll: true }); } catch (_) {}
+            }
+        }, OPT_P);
+    } catch (_) {}
     try {
         _aEL.call(W, 'pageshow', e => {
             if (!e.persisted) return;
@@ -690,6 +680,9 @@ if (_on('input')) {
     _aEL.call(W, 'selectstart', e => { if (!_inTextField) e.preventDefault(); }, OPT_AC);
     _aEL.call(W, 'contextmenu', e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_AC);
     _aEL.call(W, 'dragstart',   e => { if (!_inTextField) { e.preventDefault(); e.stopPropagation(); } }, OPT_AC);
+
+    _aEL.call(W, 'mousedown', e => { if (e.button === 1 && !_inTextField) e.preventDefault(); }, OPT_AC);
+    _aEL.call(W, 'auxclick',  e => { if (e.button === 1 && !_inTextField) e.preventDefault(); }, OPT_AC);
 
     const _ignoredCodes = new Set([
         'Space', 'Tab',
@@ -891,6 +884,13 @@ const _injectStyles = () => {
         .gota-btn:hover, button:hover { transform: translateY(-1px) !important; }
         .gota-btn:active, button:active { transform: scale(0.96) !important; transition-duration: 0.08s !important; }
 
+        .main-panel .apex-menu-grid > *,
+        .main-panel .apex-extra-grid > *,
+        .main-panel button,
+        .main-panel .gota-btn {
+            background-color: rgba(255, 255, 255, 0.02) !important;
+        }
+
         .main-panel button, .main-panel .gota-btn,
         .main-panel img + *, .server-table td:first-child {
             background-image: linear-gradient(90deg, var(--apex-v1), var(--apex-v2), var(--apex-v3), var(--apex-v2), var(--apex-v1)) !important;
@@ -1038,6 +1038,12 @@ const _injectStyles = () => {
             contain: content !important;
         }
         .main-panel img + *, .server-table td:first-child { contain: paint !important; }
+        /* v7.13.0: .apex-portal-label anima background-position Y
+           text-shadow (ninguna compositor-only) sin ningún contain -- el
+           mismo tratamiento que ya tienen los demás elementos con esta
+           clase de animación, arriba y abajo. Es un <span> sin hijos ni
+           overflow intencional, así que no hay riesgo de recortar nada. */
+        .apex-portal-label { contain: paint !important; }
 
         html.apex-in-game .xp-meter > span,
         html.apex-in-game .xp-meter > span::before,
@@ -1273,6 +1279,39 @@ const _chatLike = (el) => {
     return typeof c === 'string' && c.indexOf('chat') !== -1;
 };
 
+const _isLiveHudNode = (el) => {
+    const id = el.id;
+    return id === 'leaderboard-panel' || id === 'score-panel' || id === 'party-panel' || id === 'minimap-panel';
+};
+const _skipLive = (el) => _chatLike(el) || _isLiveHudNode(el);
+
+const _EXCLUDED_HUD_IDS = ['leaderboard-panel', 'score-panel', 'party-panel', 'minimap-panel'];
+let _hudPanels = [], _hudNext = 0;
+// v7.13.0 -- FIX: antes esta función confiaba en la caché de 1s SIN
+// chequear si los elementos cacheados seguían conectados al documento --
+// a diferencia de _getChat() (arriba), que sí revalida _chatEl.isConnected
+// antes de devolver la caché. Si Gota reemplaza el CONTENEDOR entero de
+// uno de estos 4 paneles (no solo su contenido interno) dentro de esa
+// ventana de 1s, la referencia cacheada queda apuntando a un nodo
+// DESCONECTADO -- y .contains() sobre un nodo desconectado solo ve su
+// propio subárbol desconectado, nunca el panel NUEVO y en vivo. El
+// resultado es que el filtro de exclusión de v7.5.0 deja de aplicar en
+// silencio durante esa ventana -- justo el escenario que esa versión
+// arregló (reordenamientos del leaderboard colándose a la cola de
+// barrido), pero de forma intermitente. Ahora se revalida isConnected en
+// los 4 antes de confiar en la caché, mismo patrón que _getChat.
+const _getHudPanels = () => {
+    const now = _pNow();
+    if (now < _hudNext && _hudPanels.length && _hudPanels.every(p => p.isConnected)) return _hudPanels;
+    _hudNext = now + 1000;
+    try { _hudPanels = _EXCLUDED_HUD_IDS.map(id => D.getElementById(id)).filter(Boolean); } catch (_) {}
+    return _hudPanels;
+};
+const _insideAny = (node, panels) => {
+    for (let i = 0; i < panels.length; i++) if (panels[i].contains(node)) return true;
+    return false;
+};
+
 const _sanitizeInput = el => {
     if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
         const type = el.type;
@@ -1284,10 +1323,26 @@ const _sanitizeInput = el => {
         }
     }
 };
+const _sanitizeEl = el => {
+    if (el.hasAttribute('data-gfs')) return;
+    _sanitizeInput(el);
+    el.setAttribute('data-gfs', '1');
+};
 const _sanitizeAll = () => {
     try {
         const els = D.querySelectorAll('input:not([data-gfs]), textarea:not([data-gfs])');
-        for (let i = 0; i < els.length; i++) { _sanitizeInput(els[i]); els[i].setAttribute('data-gfs', '1'); }
+        for (let i = 0; i < els.length; i++) _sanitizeEl(els[i]);
+    } catch (_) {}
+};
+const _sanitizeRoots = (roots) => {
+    try {
+        for (let i = 0; i < roots.length; i++) {
+            const root = roots[i];
+            if (!root || root.nodeType !== 1 || !root.isConnected) continue;
+            if (root.tagName === 'INPUT' || root.tagName === 'TEXTAREA') _sanitizeEl(root);
+            const els = root.querySelectorAll('input:not([data-gfs]), textarea:not([data-gfs])');
+            for (let j = 0; j < els.length; j++) _sanitizeEl(els[j]);
+        }
     } catch (_) {}
 };
 
@@ -1306,7 +1361,7 @@ const _nukeAdPanels = () => {
     } catch (_) {}
 };
 
-const _beautifyWatched = new Map();
+const _beautifyWatched = new WeakMap();
 const _watchBeautifyNode = (node) => {
     if (_beautifyWatched.has(node)) return;
     try {
@@ -1314,11 +1369,6 @@ const _watchBeautifyNode = (node) => {
         obs.observe(node, { characterData: true });
         _beautifyWatched.set(node, obs);
     } catch (_) {}
-};
-const _pruneWatchers = () => {
-    _beautifyWatched.forEach((obs, node) => {
-        if (!node.isConnected) { obs.disconnect(); _beautifyWatched.delete(node); }
-    });
 };
 
 const _closestMainPanel = (el) => {
@@ -1381,6 +1431,7 @@ const _processTextNode = (node) => {
     const val = node.nodeValue;
     if (!val) return;
 
+    if (val.length >= 7) {
     if (val.includes('arrow_range')) {
         const parent = node.parentElement;
         if (parent && !parent.classList.contains('apex-linesplit-fixed')) {
@@ -1424,6 +1475,7 @@ const _processTextNode = (node) => {
     if (val.includes('Camlan Build')) {
         node.nodeValue = val.replace('Camlan Build', 'Funkiid Build');
         return;
+    }
     }
 
     if (val.length > 24) return;
@@ -1486,7 +1538,7 @@ const _walkFilter = {
         if (n.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
         const tag = n.tagName;
         if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg') return NodeFilter.FILTER_REJECT;
-        if (_chatLike(n)) return NodeFilter.FILTER_REJECT;
+        if (_skipLive(n)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_SKIP;
     }
 };
@@ -1529,8 +1581,7 @@ const _sweepStep = (deadline) => {
 const _sweepAll = (deadline) => {
     try {
         _ensureStyles();
-        _pruneWatchers();
-        if (!D.body || _sweepWalker) return;
+        if (!D.body || _sweepWalker || _queueWalker) return;
         _sweepAccum = 0;
         _sweepWalker = D.createTreeWalker(D.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
         _sweepStep(deadline || {});
@@ -1538,41 +1589,13 @@ const _sweepAll = (deadline) => {
 };
 const _sweepSoon = (ms) => { if (_on('dom')) _st(() => _idle(_sweepAll, 500), ms); };
 
-// v7.2.0: RENDIMIENTO EN SESIONES LARGAS -- el barrido ante mutaciones ya no
-// recorre todo el `body`. Antes, cualquier mutación fuera del chat disparaba
-// _sweepAll() completo (en lotes, así que nunca bloqueaba el hilo, pero su
-// costo TOTAL por barrido crecía con la cantidad de nodos del documento --
-// y esa cantidad solo puede subir con las horas). Ahora _moCb encola los
-// NODOS AGREGADOS de cada tanda de mutación (no el contenedor que cambió) y
-// el flush escanea solo esos nodos y sus subárboles. El costo por flush
-// queda atado a lo que cambió, no al tamaño total del DOM. Si la cola se
-// desborda (250 raíces en una sola tanda -- indicio de un remount grande,
-// tipo cambio de servidor), cae UNA VEZ a un barrido completo como red de
-// seguridad, reusando la misma infraestructura chunked de siempre
-// (_sweepAll/_sweepWalker/_sweepStep, sin tocar).
 let _sweepQueue = [];
 let _sweepQueueSet = new Set();
 let _forcedFullSweep = false;
-const _SWEEP_QUEUE_CAP = 250;
+const _SWEEP_QUEUE_CAP = 2000;
 
-const _queueSweepRoot = (node, chat) => {
+const _queueSweepRoot = (node) => {
     if (!node || _sweepQueueSet.has(node)) return;
-    if (node.nodeType === 1) {
-        const tag = node.tagName;
-        // Mismo criterio que _walkFilter -- sin sentido encolar una raíz que
-        // el propio filtro rechazaría igual al caminarla.
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg') return;
-        // El filtro de la raíz que se le pasa a createTreeWalker() nunca se
-        // evalúa a sí misma -- solo rechaza lo que encuentra POR DEBAJO. Si
-        // se encolara el contenedor de chat directo como raíz, un walker
-        // enraizado ahí recorrería todo su historial igual (sus hijos no
-        // tienen "chat" en su propio id/clase). Por eso el chequeo va acá,
-        // antes de encolar, no solo dentro del walker.
-        if (_chatLike(node)) return;
-    } else if (node.nodeType !== 3) {
-        return;
-    }
-    if (chat && chat.contains(node)) return;
     _sweepQueueSet.add(node);
     _sweepQueue.push(node);
     if (_sweepQueue.length > _SWEEP_QUEUE_CAP) {
@@ -1583,38 +1606,44 @@ const _queueSweepRoot = (node, chat) => {
 };
 
 let _queueWalker = null, _queueAccum = 0;
+let _sweptRootsBatch = [];
 const _flushQueueStep = (deadline) => {
     try {
         const t0 = _pNow();
         const canDeadline = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout;
         let processed = 0, check = 0;
+        const chat = _getChat();
+        const hudPanels = _getHudPanels();
 
-        outer:
         while (true) {
-            if (!_queueWalker) {
-                let root;
-                do {
-                    root = _sweepQueue.length ? _sweepQueue.shift() : undefined;
-                    if (root !== undefined) _sweepQueueSet.delete(root);
-                } while (root !== undefined && !root.isConnected);
-                if (root === undefined) break; // cola vacía -- terminado
+            if (_queueWalker) {
+                const n = _queueWalker.nextNode();
+                if (!n) { _queueWalker = null; continue; }
+                if (n.nodeType === 3) _processTextNode(n);
+            } else {
+                const root = _sweepQueue.length ? _sweepQueue.pop() : undefined;
+                if (root === undefined) break;
+                _sweepQueueSet.delete(root);
 
-                if (root.nodeType === 3) {
-                    _processTextNode(root);
-                    processed++;
-                    if (++check >= _SWEEP_CHECK_EVERY) {
-                        check = 0;
-                        if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break outer;
+                let keep = root.isConnected;
+                if (keep) {
+                    if (root.nodeType === 1) {
+                        const tag = root.tagName;
+                        keep = !(tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg' || _skipLive(root));
+                    } else if (root.nodeType !== 3) {
+                        keep = false;
                     }
-                    if (processed >= _SWEEP_CHUNK) break outer;
-                    continue;
                 }
-                _queueWalker = D.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
+                if (keep && chat && chat.contains(root)) keep = false;
+                if (keep && hudPanels.length && _insideAny(root, hudPanels)) keep = false;
+
+                if (keep) {
+                    _sweptRootsBatch.push(root);
+                    if (root.nodeType === 3) _processTextNode(root);
+                    else _queueWalker = D.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
+                }
             }
 
-            const n = _queueWalker.nextNode();
-            if (!n) { _queueWalker = null; continue; }
-            if (n.nodeType === 3) _processTextNode(n);
             processed++;
             if (++check >= _SWEEP_CHECK_EVERY) {
                 check = 0;
@@ -1628,19 +1657,24 @@ const _flushQueueStep = (deadline) => {
         if (_queueWalker || _sweepQueue.length) {
             _idle(_flushQueueStep, 500);
         } else {
-            try { _sanitizeAll(); } catch (_) {}
+            try { _sanitizeRoots(_sweptRootsBatch); } catch (_) {}
+            _sweptRootsBatch = [];
             STAT.sweeps++; STAT.sweepMs += _queueAccum; if (_queueAccum > STAT.sweepMaxMs) STAT.sweepMaxMs = _queueAccum;
             _queueAccum = 0;
         }
     } catch (_) {
-        _queueWalker = null; _queueAccum = 0; _sweepQueue = []; _sweepQueueSet = new Set();
+        _queueWalker = null; _queueAccum = 0; _sweepQueue = []; _sweepQueueSet = new Set(); _sweptRootsBatch = [];
     }
 };
 
 let _flushTimer = 0;
 const _flush = () => {
     _flushTimer = 0;
-    if (_tabHidden) return; // se recupera al volver: _onRealVisibility llama _sweepSoon(200)
+    if (_tabHidden) return;
+    if (_sweepWalker || _queueWalker) {
+        _flushTimer = _st(_flush, 250);
+        return;
+    }
     if (_forcedFullSweep) {
         _forcedFullSweep = false;
         _sweepQueue = []; _sweepQueueSet = new Set();
@@ -1653,12 +1687,13 @@ const _flush = () => {
     _idle(_flushQueueStep, 500);
 };
 const _moCb = (recs) => {
-    const chat = _getChat();
+    if (_forcedFullSweep) {
+        if (!_flushTimer) _flushTimer = _st(_flush, _inGame ? 4000 : 300);
+        return;
+    }
     for (let i = 0; i < recs.length; i++) {
-        const rec = recs[i];
-        if (chat && chat.contains(rec.target)) continue;
-        const added = rec.addedNodes;
-        for (let j = 0; j < added.length; j++) _queueSweepRoot(added[j], chat);
+        const added = recs[i].addedNodes;
+        for (let j = 0; j < added.length; j++) _queueSweepRoot(added[j]);
     }
     if ((_sweepQueue.length || _forcedFullSweep) && !_flushTimer) {
         _flushTimer = _st(_flush, _inGame ? 4000 : 300);
