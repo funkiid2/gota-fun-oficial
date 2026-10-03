@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         gota fun v2
 // @namespace    http://tampermonkey.net/
-// @version      7.13.0
-// @description  v7.13.0: dos mejoras chicas, ambas contra costos de repintado/filtrado innecesarios. (1) FIX -- _getHudPanels() confiaba en su caché de 1s sin revalidar isConnected, a diferencia de _getChat() (que sí lo hace). Si Gota reemplaza el CONTENEDOR entero de uno de los 4 paneles (leaderboard/score/party/minimap) dentro de esa ventana, la referencia cacheada queda apuntando a un nodo desconectado -- .contains() sobre ese nodo nunca ve el panel nuevo y en vivo, así que el filtro de exclusión de v7.5.0 deja de aplicar en silencio durante esa ventana (los mismos reordenamientos del leaderboard que causaban el lag original podían volver a colarse, de forma intermitente). Ahora se revalida isConnected en los 4 antes de confiar en la caché, mismo patrón que _getChat. (2) RENDIMIENTO -- .apex-portal-label (la etiqueta "Servidores") anima background-position (nebulaMove) Y text-shadow (apexPortalAura) -- ninguna de las dos es compositor-only, ambas fuerzan repintado -- sin ningún contain en absoluto. El resto de elementos con la misma animación de gradiente (.xp-meter > span, .main-panel img + *, .server-table td:first-child) ya tienen contain:paint en _apex_perf para acotar ese repintado a su propia caja; a este se le había pasado por alto. Se agrega ahí mismo -- es un <span> sin hijos ni overflow intencional, sin riesgo visual. Deliberadamente NO se tocó .main-panel button/.gota-btn (comparten la misma animación): .apex-menu-grid > * les fija overflow:visible !important a propósito, y agregar contain:paint ahí podría recortar algo que hoy se deja desbordar sin poder verificar el resultado visual desde acá.
+// @version      8.0.0
+// @description  v8.0.0: reescritura desde cero, apuntada al síntoma "mouse con ~1s de retraso tras cambiar de pestaña / rato jugando, solo con el script". SE ELIMINA el módulo 'tab' completo: el spoof de document.hidden/visibilityState/hasFocus (el navegador SÍ pausa rAF y timers en background, pero el juego creía estar visible, no corría su lógica de "estuve oculto" y al volver procesaba un backlog de golpe), el AudioContext keep-alive, el wake lock y los handlers de visibilitychange/focus/pageshow. También: preconnect dinámico con TTL salteado y handler 'online', spoof de navigator.connection, override de ws.binaryType (el getter mentía y el set del juego se tragaba) y de ws.send, supresión de securitypolicyviolation/ReportingObserver, y el loop de 5 min de wipeStorage (setItem ya bloquea esas claves). SE ARREGLA: el bloqueador dejaba pasar '//host/...' (c0===47) y matcheaba por substring ('cheap.io' caía en 'heap.io') con new URL() por llamada -- ahora sufijo exacto de dominio sin parsear; 'Servidores' se renombra en el mismo nodo (antes span extra con glow + texto fantasma); Enter en partida disparaba _handleJoin en cada pulsación (abrir chat) -- ahora sale si ya se está in-game; el loader usaba innerText (layout forzado) -- ahora textContent; 'apex-full-row' no tenía CSS (clase muerta). SE OPTIMIZA: un solo <style>, CSS muerto fuera, transition:all acotado; el recorrido del DOM es un DFS manual resumible (sin TreeWalker + callback JS por nodo) en tajadas de 4ms, un único motor para raíces y barrido completo, y el filtro de chat/HUD corre dentro de la tajada, no en el microtask del MutationObserver. Historial previo (v7.x) condensado: cola de raíces por mutaciones, exclusión de chat y 4 paneles HUD, freno por tiempo, guard de longitud en _processTextNode, prevención de autoscroll por click central, WeakMap en watchers.
+//
+// v6.0.0 (reimaginado): núcleo mínimo + interruptores de diagnóstico (__gf).
 // @author       funkiid
 // @updateURL    https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
 // @downloadURL  https://github.com/funkiid2/gota-fun/raw/refs/heads/main/gota-fun.user.js
@@ -19,13 +21,14 @@
 (function () {
 'use strict';
 
-const SCRIPT_VERSION = '7.13.0';
+const SCRIPT_VERSION = '8.0.0';
 const W = window, D = document;
 
 const RENDER_SCALE = 1.0;
 const RETINA_PERF_MODE = false;
 const QUIET_CONSOLE = false;
 
+// ─── Interruptores de diagnóstico: __gf.set('dom,css', true) + recargar ───
 let _lsOff = '', _lsDebug = false;
 try {
     _lsOff = W.localStorage.getItem('gf_off') || '';
@@ -45,7 +48,7 @@ W.__gf = {
             if (off !== undefined) W.localStorage.setItem('gf_off', String(off));
             if (debug !== undefined) W.localStorage.setItem('gf_debug', debug ? '1' : '0');
         } catch (_) {}
-        return 'Recargá la página (F5) para aplicar.';
+        return 'Recargá la página para aplicar.';
     },
 };
 
@@ -64,34 +67,25 @@ if (RETINA_PERF_MODE) {
 }
 
 const NOP = () => {};
-const RL = D.head || D.documentElement;
 const _pNow      = performance.now.bind(performance);
 const _rAF       = W.requestAnimationFrame.bind(W);
 const _st        = W.setTimeout.bind(W);
+const _ct        = W.clearTimeout.bind(W);
 const _si        = W.setInterval.bind(W);
 const _origCE    = D.createElement.bind(D);
 const _elRemove  = Element.prototype.remove;
 const _aEL       = EventTarget.prototype.addEventListener;
-const _rEL       = EventTarget.prototype.removeEventListener;
 
 const OPT_P  = Object.freeze({ passive: true });
 const OPT_O  = Object.freeze({ once: true, passive: true });
 const OPT_AC = Object.freeze({ capture: true, passive: false });
 
-const _hDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
-               Object.getOwnPropertyDescriptor(D, 'hidden');
-const _getRealHidden = (_hDesc && _hDesc.get)
-    ? () => { try { return _hDesc.get.call(D); } catch (_) { return false; } }
-    : () => false;
-
-let _tabHidden = _getRealHidden();
 let _inGame = false;
 let _isNewServer = true;
-let _lastWSOrigin = null;
 let _gameCanvas = null;
 let _inTextField = false;
 let _joinGraceUntil = 0;
-let _sacredStyleEl = null, _perfStyleEl = null;
+let _styleEl = null;
 let _loader = null;
 
 const _idle = (fn, timeout) => {
@@ -119,8 +113,9 @@ const _lru = (max) => {
     };
 };
 
-const STAT = { sweeps: 0, sweepMs: 0, sweepMaxMs: 0, flushes: 0 };
+const STAT = { sweeps: 0, sweepMs: 0, sweepMaxMs: 0, sliceMaxMs: 0, flushes: 0 };
 
+// ─── Debug (solo con gf_debug=1) ───
 const _dbgLog = [];
 const _dbg = e => { _dbgLog.push(e); if (_dbgLog.length > 600) _dbgLog.splice(0, 200); };
 if (DEBUG) {
@@ -181,7 +176,7 @@ const _report = () => {
     };
 };
 W.__gf.report = _report;
-W.__gf.stats = () => Object.assign({}, STAT, { inGame: _inGame, tabHidden: _tabHidden });
+W.__gf.stats = () => Object.assign({}, STAT, { inGame: _inGame });
 W.__freezeSummary = _report;
 
 if (QUIET_CONSOLE && !DEBUG) {
@@ -195,22 +190,78 @@ if (QUIET_CONSOLE && !DEBUG) {
     }
 }
 
-const _ORI = location.origin;
-const _BLK_RX = new RegExp('google-analytics\\.com|googletagmanager\\.com|googletagservices\\.com|googlesyndication\\.com|doubleclick\\.net|googleadservices\\.com|facebook\\.net|analytics\\.facebook\\.com|onesignal\\.com|hotjar\\.com|clarity\\.ms|mixpanel\\.com|amplitude\\.com|fullstory\\.com|segment\\.com|segment\\.io|sentry\\.io|browser\\.sentry-cdn\\.com|newrelic\\.com|nr-data\\.net|datadoghq\\.com|logrocket\\.com|posthog\\.com|plausible\\.io|mouseflow\\.com|luckyorange\\.com|smartlook\\.com|heap\\.io|heapanalytics\\.com|static\\.cloudflareinsights\\.com|cloudflareinsights\\.com|cdn\\.addinplay\\.com|addinplay\\.com|pubmatic\\.com|criteo\\.com|taboola\\.com|outbrain\\.com|raygun\\.io|bugsnag\\.com|rubiconproject\\.com|openx\\.net|amazon-adsystem\\.com|optimizely\\.com|quantserve\\.com|comscore\\.com|chartbeat\\.com|parsely\\.com|branch\\.io|adjust\\.com|kochava\\.com|appsflyer\\.com|moengage\\.com|clevertap\\.com|leanplum\\.com|analytics\\.tiktok\\.com|px\\.ads\\.linkedin\\.com|ct\\.pinterest\\.com', 'i');
+// ═══════════════════════════════════════════════════════════════════════
+// BLOQUEADOR (anuncios / analítica)
+// ═══════════════════════════════════════════════════════════════════════
+// v8.0.0: sufijo EXACTO de dominio. Antes era un regex por substring sobre
+// el hostname ('cheap.io' matcheaba 'heap.io') precedido de un atajo por
+// primer carácter que dejaba pasar '//host/...' (protocol-relative) y de un
+// new URL() por llamada. Ahora se extrae el host a mano del string y se
+// chequea cada sufijo por etiquetas (a.b.c.com -> a.b.c.com, b.c.com,
+// c.com) contra un Set; resultado cacheado por host.
+const _BLOCKED = new Set([
+    'google-analytics.com', 'googletagmanager.com', 'googletagservices.com', 'googlesyndication.com',
+    'doubleclick.net', 'googleadservices.com', 'facebook.net', 'analytics.facebook.com', 'onesignal.com',
+    'hotjar.com', 'clarity.ms', 'mixpanel.com', 'amplitude.com', 'fullstory.com', 'segment.com',
+    'segment.io', 'sentry.io', 'browser.sentry-cdn.com', 'newrelic.com', 'nr-data.net', 'datadoghq.com',
+    'logrocket.com', 'posthog.com', 'plausible.io', 'mouseflow.com', 'luckyorange.com', 'smartlook.com',
+    'heap.io', 'heapanalytics.com', 'static.cloudflareinsights.com', 'cloudflareinsights.com',
+    'cdn.addinplay.com', 'addinplay.com', 'pubmatic.com', 'criteo.com', 'taboola.com', 'outbrain.com',
+    'raygun.io', 'bugsnag.com', 'rubiconproject.com', 'openx.net', 'amazon-adsystem.com',
+    'optimizely.com', 'quantserve.com', 'comscore.com', 'chartbeat.com', 'parsely.com', 'branch.io',
+    'adjust.com', 'kochava.com', 'appsflyer.com', 'moengage.com', 'clevertap.com', 'leanplum.com',
+    'analytics.tiktok.com', 'px.ads.linkedin.com', 'ct.pinterest.com',
+]);
 
-const _sbCache = _lru(200);
+// host en minúsculas de una URL absoluta o protocol-relative; '' si es
+// relativa, same-origin por ruta, data:, blob:, javascript:, etc.
+function _hostOf(s) {
+    let c0 = s.charCodeAt(0);
+    if (c0 <= 32) { s = s.trim(); c0 = s.charCodeAt(0); }
+    let i;
+    if (c0 === 47 || c0 === 92) {                        // '/' o '\'
+        const c1 = s.charCodeAt(1);
+        if (c1 !== 47 && c1 !== 92) return '';           // '/ruta' -> mismo origen
+        i = 2;                                           // '//host/...'
+    } else {
+        i = s.indexOf(':');
+        if (i < 1 || s.charCodeAt(i + 1) !== 47 || s.charCodeAt(i + 2) !== 47) return '';
+        i += 3;
+    }
+    let end = s.length;
+    for (let k = i; k < end; k++) {
+        const c = s.charCodeAt(k);
+        if (c === 47 || c === 92 || c === 63 || c === 35) { end = k; break; }   // / \ ? #
+    }
+    const at = s.lastIndexOf('@', end - 1);              // user:pass@
+    if (at >= i) i = at + 1;
+    let pe = end;
+    for (let k = end - 1; k >= i; k--) {                 // :puerto (IPv6 corta en ']')
+        const c = s.charCodeAt(k);
+        if (c === 58) { pe = k; break; }
+        if (c === 93) break;
+    }
+    if (pe > i && s.charCodeAt(pe - 1) === 46) pe--;     // punto final
+    if (pe <= i) return '';
+    return s.slice(i, pe).toLowerCase();
+}
+
+const _hostCache = _lru(200);
 function _sb(url) {
     if (!url) return 0;
     const s = typeof url === 'string' ? url : '' + url;
-    const c0 = s.charCodeAt(0);
-    if (c0 === 47 || c0 === 100 || c0 === 98 || c0 === 119) return 0;
-    if (s.startsWith(_ORI)) return 0;
-    let hn;
-    try { hn = new URL(s, _ORI).hostname; } catch (_) { return 0; }
-    const cached = _sbCache.get(hn);
+    const host = _hostOf(s);
+    if (!host) return 0;
+    const cached = _hostCache.get(host);
     if (cached !== undefined) return cached;
-    const r = _BLK_RX.test(hn) ? 1 : 0;
-    _sbCache.set(hn, r);
+    let r = 0, h = host;
+    for (;;) {
+        if (_BLOCKED.has(h)) { r = 1; break; }
+        const dot = h.indexOf('.');
+        if (dot === -1) break;
+        h = h.slice(dot + 1);
+    }
+    _hostCache.set(host, r);
     return r;
 }
 
@@ -230,34 +281,8 @@ const _blkEl = el => {
     if (!_trashPending) { _trashPending = true; _scheduleTrash(_emptyTrash); }
 };
 
-const _preconnectedOrigins = new Map();
-const _preconnectEls = new Map();
-const PRECONNECT_TTL_MS = 30000;
-const _preconnectOrigin = origin => {
-    if (!_on('net') || !origin) return;
-    const now = _pNow();
-    const last = _preconnectedOrigins.get(origin);
-    if (last !== undefined && (now - last) < PRECONNECT_TTL_MS) return;
-    _preconnectedOrigins.set(origin, now);
-    try {
-        const prev = _preconnectEls.get(origin);
-        if (prev) {
-            try { if (prev.pc && prev.pc.isConnected) _elRemove.call(prev.pc); } catch (_) {}
-            try { if (prev.dp && prev.dp.isConnected) _elRemove.call(prev.dp); } catch (_) {}
-        }
-        const frag = D.createDocumentFragment();
-        const pc = _origCE('link'); pc.rel = 'preconnect'; pc.href = origin; pc.crossOrigin = 'anonymous'; try { pc.fetchPriority = 'high'; } catch (_) {} frag.appendChild(pc);
-        const dp = _origCE('link'); dp.rel = 'dns-prefetch'; dp.href = origin; frag.appendChild(dp);
-        (D.head || D.documentElement).appendChild(frag);
-        _preconnectEls.set(origin, { pc, dp });
-    } catch (_) {}
-};
-
 if (_on('net')) {
     try { W.ga = W.gtag = W.fbq = W._fbq = NOP; W.dataLayer = { push: NOP }; D.write = D.writeln = NOP; } catch (_) {}
-
-    try { W.addEventListener('securitypolicyviolation', e => { e.stopImmediatePropagation(); e.preventDefault(); }, true); } catch (_) {}
-    try { if (W.ReportingObserver) W.ReportingObserver = () => ({ observe: NOP, disconnect: NOP }); } catch (_) {}
 
     try {
         const _origFetch = W.fetch;
@@ -333,6 +358,8 @@ if (_on('net')) {
         }
     } catch (_) {}
 
+    // setItem bloquea las claves de tracking; el barrido de lo que ya
+    // estuviera guardado de sesiones anteriores se hace UNA vez al arrancar.
     try {
         const _BAD = ['_ga', '_gid', '_gat', '_gcl', '_fbp', '_fbc', '_hjid', '_hjSession', 'amplitude_', 'amp_', 'ajs_', 'mp_', 'clarity-', 'ph_', 'posthog'];
         const _BAD_RX = new RegExp('^(?:' + _BAD.join('|') + ')');
@@ -343,16 +370,11 @@ if (_on('net')) {
             if (_BAD_RX.test(key)) return;
             return _oLSSet.call(this, key, v);
         };
-        const _wipeStorage = () => {
-            try {
-                const st = W.localStorage; const toDelete = []; let i = st.length;
-                while (i--) { try { const k = st.key(i); if (k && _BAD_RX.test(k)) toDelete.push(k); } catch (_) {} }
-                i = toDelete.length; while (i--) try { _oLSDel.call(st, toDelete[i]); } catch (_) {}
-            } catch (_) {}
-        };
-        _wipeStorage();
-        const _wipeStorageLoop = () => { _wipeStorage(); _st(() => _idle(_wipeStorageLoop, 2000), 300000); };
-        _st(() => _idle(_wipeStorageLoop, 2000), 300000);
+        try {
+            const st = W.localStorage; const toDelete = []; let i = st.length;
+            while (i--) { try { const k = st.key(i); if (k && _BAD_RX.test(k)) toDelete.push(k); } catch (_) {} }
+            i = toDelete.length; while (i--) try { _oLSDel.call(st, toDelete[i]); } catch (_) {}
+        } catch (_) {}
     } catch (_) {}
 
     try {
@@ -376,16 +398,7 @@ if (_on('net')) {
         if (_pCRT) _pCRT();
     } catch (_) {}
 
-    try {
-        const _conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
-        if (_conn) {
-            Object.defineProperty(_conn, 'saveData', { get: () => false, configurable: true });
-            try { Object.defineProperty(_conn, 'effectiveType', { get: () => '4g', configurable: true }); } catch (_) {}
-            try { Object.defineProperty(_conn, 'downlink', { get: () => 10, configurable: true }); } catch (_) {}
-            try { Object.defineProperty(_conn, 'rtt', { get: () => 50, configurable: true }); } catch (_) {}
-        }
-    } catch (_) {}
-
+    // Hints estáticos al cargar (una sola vez; ya no hay preconnect dinámico).
     try {
         const frag = D.createDocumentFragment();
         const hs = [
@@ -401,37 +414,10 @@ if (_on('net')) {
             const pc = _origCE('link'); pc.rel = 'preconnect'; pc.href = hs[i][0]; pc.crossOrigin = 'anonymous';
             try { pc.fetchPriority = hs[i][1]; } catch (_) {} frag.appendChild(pc);
             const dp = _origCE('link'); dp.rel = 'dns-prefetch'; dp.href = hs[i][0]; frag.appendChild(dp);
-            try { _preconnectedOrigins.set(new URL(hs[i][0], location.href).origin, _pNow()); } catch (_) {}
         }
-        RL.appendChild(frag);
-    } catch (_) {}
-
-    try {
-        _aEL.call(W, 'online', () => {
-            if (_lastWSOrigin) { _preconnectedOrigins.delete(_lastWSOrigin); _preconnectOrigin(_lastWSOrigin); }
-        }, OPT_P);
+        (D.head || D.documentElement).appendChild(frag);
     } catch (_) {}
 }
-
-let _audioCtx = null, _audioGestureOk = false;
-const _initAudio = () => {
-    try {
-        if (_audioCtx) { if (_audioCtx.state === 'suspended') _audioCtx.resume().catch(NOP); else if (_audioCtx.state === 'closed') { _audioCtx = null; _initAudio(); } return; }
-        const AC = W.AudioContext || W.webkitAudioContext; if (!AC) return;
-        _audioCtx = new AC({ latencyHint: 'playback', sampleRate: 8000 });
-        const buf = _audioCtx.createBuffer(1, _audioCtx.sampleRate, _audioCtx.sampleRate);
-        const ch = buf.getChannelData(0); let i = ch.length; while (i--) ch[i] = (i & 1 ? 1 : -1);
-        const src = _audioCtx.createBufferSource(); src.buffer = buf; src.loop = true;
-        const gain = _audioCtx.createGain();
-        gain.gain.value = 0.001;
-        src.connect(gain); gain.connect(_audioCtx.destination); src.start(0);
-    } catch (_) {}
-};
-const _suspendAudio = () => { try { if (_audioCtx && _audioCtx.state === 'running') _audioCtx.suspend(); } catch (_) {} };
-const _resumeAudio = () => {
-    if (!_audioGestureOk) return;
-    try { if (!_audioCtx) { _initAudio(); return; } if (_audioCtx.state === 'suspended') _audioCtx.resume().catch(NOP); else if (_audioCtx.state === 'closed') { _audioCtx = null; _initAudio(); } } catch (_) {}
-};
 
 let _storagePersistDone = false;
 const _requestStoragePersist = () => {
@@ -443,30 +429,26 @@ const _requestStoragePersist = () => {
         }
     } catch (_) {}
 };
+_aEL.call(D, 'DOMContentLoaded', _requestStoragePersist, OPT_O);
 
+// ═══════════════════════════════════════════════════════════════════════
+// WEBSOCKET -- v8.0.0: ya NO se toca el socket (ni binaryType ni send).
+// La subclase existe solo para marcar "servidor nuevo" (loader CONECTANDO).
+// ═══════════════════════════════════════════════════════════════════════
 if (_on('ws')) {
     try {
         const _OrigWS = W.WebSocket;
-        const _origWSSend = _OrigWS.prototype.send;
-        const GfWS = function WebSocket(url, protos) {
-            _isNewServer = true;
-            try { _lastWSOrigin = new URL(url, location.href).origin.replace(/^wss?:/, 'https:'); _preconnectOrigin(_lastWSOrigin); } catch (_) {}
-            const ws = protos !== undefined ? new _OrigWS(url, protos) : new _OrigWS(url);
-            try {
-                Object.defineProperty(ws, 'binaryType', { get() { return 'arraybuffer'; }, set() {}, configurable: true });
-            } catch (_) { ws.binaryType = 'arraybuffer'; }
-            Object.defineProperty(ws, 'send', { value: _origWSSend, writable: false, configurable: false });
-            _resumeAudio();
-            _requestStoragePersist();
-            return ws;
-        };
-        GfWS.prototype = _OrigWS.prototype;
-        Object.setPrototypeOf(GfWS, _OrigWS);
-        Object.defineProperty(GfWS, Symbol.hasInstance, { value: o => o instanceof _OrigWS, writable: false, configurable: true });
+        class GfWS extends _OrigWS {
+            constructor(url, protos) { _isNewServer = true; super(url, protos); }
+        }
+        try { Object.defineProperty(GfWS, 'name', { value: 'WebSocket' }); } catch (_) {}
         W.WebSocket = GfWS;
     } catch (_) {}
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// CANVAS / RENDER SCALE
+// ═══════════════════════════════════════════════════════════════════════
 const _RS_ACTIVE = (typeof RENDER_SCALE === 'number' && RENDER_SCALE > 0 && RENDER_SCALE !== 1);
 const _rsWDesc = _RS_ACTIVE ? Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width')  : null;
 const _rsHDesc = _RS_ACTIVE ? Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height') : null;
@@ -591,79 +573,9 @@ W.__gf.canvas = () => ({
     gameCanvasFound: !!_gameCanvas,
 });
 
-let _wakelock = null, _wakelockPending = false;
-const _acqWL = async () => {
-    if (_wakelockPending || _wakelock || !navigator.wakeLock) return;
-    _wakelockPending = true;
-    try {
-        _wakelock = await navigator.wakeLock.request('screen');
-        _wakelock.addEventListener('release', () => { _wakelock = null; if (!_tabHidden) _st(_acqWL, 1000); }, OPT_O);
-    } catch (_) {
-    } finally {
-        _wakelockPending = false;
-    }
-};
-
-if (_on('tab')) {
-    try {
-        Object.defineProperty(D, 'hidden', { get: () => false, configurable: true });
-        Object.defineProperty(D, 'visibilityState', { get: () => 'visible', configurable: true });
-        try {
-            Object.defineProperty(Document.prototype, 'hidden', { get: () => false, configurable: true });
-            Object.defineProperty(Document.prototype, 'visibilityState', { get: () => 'visible', configurable: true });
-        } catch (_) {}
-    } catch (_) {}
-    try { Document.prototype.hasFocus = function () { return true; }; } catch (_) {}
-
-    const _onRealVisibility = () => {
-        const realHidden = _getRealHidden();
-        if (realHidden && !_tabHidden) {
-            _tabHidden = true;
-            try { if (_wakelock) _wakelock.release(); } catch (_) {} _wakelock = null;
-            _suspendAudio();
-        } else if (!realHidden && _tabHidden) {
-            _tabHidden = false; _resumeAudio(); _acqWL();
-            if (_lastWSOrigin) { _preconnectedOrigins.delete(_lastWSOrigin); _preconnectOrigin(_lastWSOrigin); }
-            _sweepSoon(200);
-            if (_gameCanvas) {
-                _st(() => {
-                    try { if (!_tabHidden && !_inTextField) _gameCanvas.focus({ preventScroll: true }); } catch (_) {}
-                }, 50);
-            }
-        }
-    };
-    _aEL.call(D, 'visibilitychange', _onRealVisibility, true);
-
-    _aEL.call(D, 'DOMContentLoaded', _acqWL, OPT_O);
-    try {
-        _aEL.call(W, 'focus', () => {
-            if (!_wakelock) _acqWL();
-            if (_gameCanvas && !_inTextField) {
-                try { _gameCanvas.focus({ preventScroll: true }); } catch (_) {}
-            }
-        }, OPT_P);
-    } catch (_) {}
-    try {
-        _aEL.call(W, 'pageshow', e => {
-            if (!e.persisted) return;
-            _wakelock = null;
-            _resumeAudio();
-            if (!_tabHidden) _acqWL();
-        }, OPT_P);
-    } catch (_) {}
-
-    const _onFirstGesture = () => {
-        _audioGestureOk = true; _initAudio();
-        try { _rEL.call(D, 'click',      _onFirstGesture, true); } catch (_) {}
-        try { _rEL.call(D, 'keydown',    _onFirstGesture, true); } catch (_) {}
-        try { _rEL.call(D, 'touchstart', _onFirstGesture, true); } catch (_) {}
-    };
-    _aEL.call(D, 'click',      _onFirstGesture, { capture: true, passive: true, once: true });
-    _aEL.call(D, 'keydown',    _onFirstGesture, { capture: true, passive: true, once: true });
-    _aEL.call(D, 'touchstart', _onFirstGesture, { capture: true, passive: true, once: true });
-}
-_aEL.call(D, 'DOMContentLoaded', _requestStoragePersist, OPT_O);
-
+// ═══════════════════════════════════════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════════════════════════════════════
 if (_on('input')) {
     const _NOTEXT = new Set(['checkbox', 'radio', 'range', 'button', 'submit', 'reset', 'file', 'image', 'color']);
     _aEL.call(W, 'focusin', e => {
@@ -698,25 +610,10 @@ if (_on('input')) {
     }, OPT_AC);
 }
 
-const _injectStyles = () => {
-    try {
-        const head = D.head || D.documentElement;
-        const frag = D.createDocumentFragment();
-        const pc1 = _origCE('link'); pc1.rel = 'preconnect'; pc1.href = 'https://fonts.googleapis.com'; frag.appendChild(pc1);
-        const pc2 = _origCE('link'); pc2.rel = 'preconnect'; pc2.href = 'https://fonts.gstatic.com'; pc2.crossOrigin = 'anonymous'; frag.appendChild(pc2);
-        const fontLink = _origCE('link');
-        fontLink.rel = 'stylesheet';
-        fontLink.href = 'https://fonts.googleapis.com/css2?family=Karla:wght@400;700&display=swap';
-        fontLink.id = '_apex_font';
-        fontLink.media = 'print';
-        fontLink.onload = function () { this.onload = null; this.media = 'all'; };
-        frag.appendChild(fontLink);
-        head.insertBefore(frag, head.firstChild);
-    } catch (_) {}
-
-    const sacredStyle = _origCE('style');
-    sacredStyle.id = '_apex_sacred';
-    sacredStyle.textContent = `
+// ═══════════════════════════════════════════════════════════════════════
+// ESTILOS -- v8.0.0: UN solo <style>, sin CSS muerto, transition acotado.
+// ═══════════════════════════════════════════════════════════════════════
+const _CSS = `
         :root {
             --apex-v1: #3a1c71;
             --apex-v2: #8a2be2;
@@ -728,10 +625,16 @@ const _injectStyles = () => {
 
         body {
             font-family: 'Karla', sans-serif !important;
+            overscroll-behavior: none !important;
             cursor: url("data:image/svg+xml;charset=utf-8,%3Csvg width='32' height='32' viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cline x1='16' y1='2' x2='16' y2='30' stroke='%238a2be2' stroke-width='2' stroke-linecap='round'/%3E%3Cline x1='2' y1='16' x2='30' y2='16' stroke='%238a2be2' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23d76d77' stroke='%233a1c71' stroke-width='1'/%3E%3C/svg%3E") 16 16, crosshair !important;
         }
-        .logo, #logo, img[src*="logo"] {
-            display: none !important;
+        .logo, #logo, img[src*="logo"] { display: none !important; }
+
+        canvas {
+            image-rendering: auto !important;
+            touch-action: none !important;
+            -webkit-user-select: none !important; user-select: none !important;
+            outline: none !important;
         }
 
         .xp-meter {
@@ -744,6 +647,7 @@ const _injectStyles = () => {
             position: relative !important; display: block !important; height: 100% !important;
             background: linear-gradient(90deg, #020111, var(--apex-v1), var(--apex-v3), var(--apex-v1), #020111) !important;
             background-size: 200% 100% !important; animation: nebulaMove 6s linear infinite !important;
+            contain: paint !important;
         }
         .xp-meter > span::before {
             content: "" !important; position: absolute !important; top: 0; left: 0; right: 0; bottom: 0 !important;
@@ -752,6 +656,9 @@ const _injectStyles = () => {
         }
         @keyframes nebulaMove { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
         @keyframes starsMove { from { background-position: 0 0; } to { background-position: -100px 0; } }
+
+        #chat-container, #score-panel, #party-panel, #leaderboard-panel,
+        #minimap-panel, #minimap, .minimap, #mini-map, .mini-map { contain: content !important; }
 
         #score-panel, #party-panel {
             background: rgba(4, 2, 10, 0.22) !important;
@@ -799,6 +706,10 @@ const _injectStyles = () => {
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.09),
                         0 22px 50px rgba(0, 0, 0, 0.5) !important;
         }
+        @keyframes apexMenuIn {
+            0%   { opacity: 0; transform: translateY(8px) scale(0.98); }
+            100% { opacity: 1; transform: translateY(0)   scale(1); }
+        }
 
         .apex-menu-row { display: flex !important; align-items: flex-start !important; gap: 18px !important; }
         .apex-left-col { display: flex !important; flex-direction: column !important; gap: 6px !important; }
@@ -844,7 +755,7 @@ const _injectStyles = () => {
             border: 1px solid var(--apex-line) !important;
             color: var(--apex-ink) !important;
             border-radius: 9px !important; padding: 10px !important;
-            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
             box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5) !important;
         }
         .main-panel input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
@@ -884,12 +795,11 @@ const _injectStyles = () => {
         .gota-btn:hover, button:hover { transform: translateY(-1px) !important; }
         .gota-btn:active, button:active { transform: scale(0.96) !important; transition-duration: 0.08s !important; }
 
+        /* precedencia intencional: dentro del menú el fondo de los botones queda fijo en .02 */
         .main-panel .apex-menu-grid > *,
         .main-panel .apex-extra-grid > *,
         .main-panel button,
-        .main-panel .gota-btn {
-            background-color: rgba(255, 255, 255, 0.02) !important;
-        }
+        .main-panel .gota-btn { background-color: rgba(255, 255, 255, 0.02) !important; }
 
         .main-panel button, .main-panel .gota-btn,
         .main-panel img + *, .server-table td:first-child {
@@ -900,11 +810,21 @@ const _injectStyles = () => {
             animation: nebulaMove 6s linear infinite !important;
             font-weight: 700 !important;
         }
+        .main-panel img + *, .server-table td:first-child { contain: paint !important; }
         .main-panel img { animation: apexAvatarBreath 4s ease-in-out infinite !important; border-radius: 10px !important; }
         @keyframes apexAvatarBreath {
             0%, 100% { transform: scale(1); }
             50%      { transform: scale(1.015); }
         }
+
+        /* en partida el menú no se ve: se pausan sus animaciones continuas */
+        html.apex-in-game .xp-meter > span,
+        html.apex-in-game .xp-meter > span::before,
+        html.apex-in-game .main-panel img,
+        html.apex-in-game .main-panel button,
+        html.apex-in-game .main-panel .gota-btn,
+        html.apex-in-game .main-panel img + *,
+        html.apex-in-game .server-table td:first-child { animation-play-state: paused !important; }
 
         .server-table {
             contain: paint !important;
@@ -929,20 +849,6 @@ const _injectStyles = () => {
             background: transparent !important; color: #fff !important;
         }
 
-        .apex-portal-label {
-            display: inline-block !important;
-            background: linear-gradient(90deg, var(--apex-v1), var(--apex-v2), var(--apex-v3), var(--apex-v2), var(--apex-v1)) !important;
-            background-size: 200% 100% !important;
-            -webkit-background-clip: text !important; background-clip: text !important;
-            color: transparent !important; -webkit-text-fill-color: transparent !important;
-            font-weight: 700 !important;
-            animation: nebulaMove 6s linear infinite, apexPortalAura 2s ease-in-out infinite !important;
-        }
-        @keyframes apexPortalAura {
-            0%, 100% { text-shadow: 0 0 10px rgba(138, 43, 226, 0.5),  0 0 20px rgba(215, 109, 119, 0.25); }
-            50%      { text-shadow: 0 0 18px rgba(138, 43, 226, 0.85), 0 0 34px rgba(215, 109, 119, 0.5); }
-        }
-
         #main-left-ad, #main-right-ad, #main-bottom-ad, #chat-container-ads, #main-bottom,
         .ad-container, #ad-container, .advertisement, #ad-block, .adblock-container,
         #onesignal-bell-container, .main-bottom-links, .social-media-box, .bottom-right-panel,
@@ -963,6 +869,7 @@ const _injectStyles = () => {
             animation: apexPulseCyan 1.5s infinite alternate !important;
             white-space: nowrap !important; z-index: 9999 !important;
             text-shadow: 0 0 8px rgba(0,255,255,0.6), 0 1px 3px rgba(0,0,0,0.9) !important;
+            contain: layout style !important;
         }
         .apex-linesplit-fixed[style*="display: none"],
         .apex-linesplit-fixed[style*="display:none"],
@@ -992,9 +899,10 @@ const _injectStyles = () => {
             font-family: 'Karla', sans-serif !important; font-weight: 700 !important;
             letter-spacing: 1.5px !important;
             display: inline-flex !important; align-items: center !important; justify-content: center !important;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            transition: box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
             z-index: 9999 !important;
             text-shadow: 0 0 5px rgba(255,255,255,0.4), 0 1px 3px rgba(0,0,0,0.9) !important;
+            contain: layout style !important;
         }
         .apex-timer-container[style*="display: none"],
         .apex-timer-container[style*="display:none"],
@@ -1016,46 +924,9 @@ const _injectStyles = () => {
             background-size: cover !important; background-position: center !important;
             animation: apexSpin 2.5s linear infinite !important; margin-right: 10px !important;
         }
-    `;
+        @keyframes apexSpin  { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
-    const perfStyle = _origCE('style');
-    perfStyle.id = '_apex_perf';
-    perfStyle.textContent = `
-        body { overscroll-behavior: none !important; }
-        canvas { image-rendering: auto !important; }
-
-        canvas {
-            touch-action: none !important;
-            -webkit-user-select: none !important; user-select: none !important;
-            outline: none !important;
-        }
-
-        .apex-timer-container, .apex-linesplit-fixed { contain: layout style !important; }
-        .xp-meter > span { contain: paint !important; }
-
-        #chat-container, #score-panel, #party-panel, #leaderboard-panel,
-        #minimap-panel, #minimap, .minimap, #mini-map, .mini-map {
-            contain: content !important;
-        }
-        .main-panel img + *, .server-table td:first-child { contain: paint !important; }
-        /* v7.13.0: .apex-portal-label anima background-position Y
-           text-shadow (ninguna compositor-only) sin ningún contain -- el
-           mismo tratamiento que ya tienen los demás elementos con esta
-           clase de animación, arriba y abajo. Es un <span> sin hijos ni
-           overflow intencional, así que no hay riesgo de recortar nada. */
-        .apex-portal-label { contain: paint !important; }
-
-        html.apex-in-game .xp-meter > span,
-        html.apex-in-game .xp-meter > span::before,
-        html.apex-in-game .apex-portal-label,
-        html.apex-in-game .main-panel img,
-        html.apex-in-game .main-panel button,
-        html.apex-in-game .main-panel .gota-btn,
-        html.apex-in-game .main-panel img + *,
-        html.apex-in-game .server-table td:first-child {
-            animation-play-state: paused !important;
-        }
-
+        /* ── intro ── */
         #apex-bh-ring, #apex-bh-photon, #apex-bh-disk, #apex-bh-front { transform-box: view-box; transform-origin: 380px 210px; }
         #apex-bh-glow   { animation: apexBHBreath 6s ease-in-out infinite; contain: paint !important; }
         #apex-bh-ring   { animation: apexBHRing 4.5s ease-in-out infinite, apexBHSpinCW 42s linear infinite; contain: paint !important; }
@@ -1067,10 +938,6 @@ const _injectStyles = () => {
         @keyframes apexBHSpinCW   { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes apexBHSpinCCW  { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
         @keyframes apexBHDiskWave { 0%, 100% { transform: scale(1, 1); } 50% { transform: scale(1.015, 1.07); } }
-        @keyframes apexMenuIn {
-            0%   { opacity: 0; transform: translateY(8px) scale(0.98); }
-            100% { opacity: 1; transform: translateY(0)   scale(1); }
-        }
 
         #apex-loader {
             position: fixed !important; top: 0 !important; left: 0 !important;
@@ -1112,7 +979,6 @@ const _injectStyles = () => {
             animation: nebulaPulse 18s ease-in-out infinite alternate !important;
             pointer-events: none !important;
         }
-
         .apex-loader-text {
             margin-top: 10px !important; color: #f2ecff !important; font-size: 15px !important;
             font-weight: 700 !important; letter-spacing: 9px !important; text-transform: uppercase !important;
@@ -1120,20 +986,37 @@ const _injectStyles = () => {
             text-shadow: 0 0 18px rgba(255, 45, 149, 0.35), 0 0 4px rgba(255,255,255,0.35) !important;
             animation: apexPulse 2.6s ease-in-out infinite !important; z-index: 10 !important;
         }
-
         @keyframes spaceStars { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes nebulaPulse {
             0%   { transform: scale(1)    translate(0, 0);      opacity: 0.5; }
             50%  { transform: scale(1.25) translate(30px, -20px); opacity: 0.85; }
             100% { transform: scale(1)    translate(-30px, 20px); opacity: 0.5; }
         }
-        @keyframes apexSpin  { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         @keyframes apexPulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; transform: scale(1.05); } }
-    `;
+`;
 
-    const currentHead = D.head || D.documentElement;
-    if (currentHead) { currentHead.appendChild(sacredStyle); currentHead.appendChild(perfStyle); }
-    _sacredStyleEl = sacredStyle; _perfStyleEl = perfStyle;
+const _injectStyles = () => {
+    try {
+        const head = D.head || D.documentElement;
+        const frag = D.createDocumentFragment();
+        const pc1 = _origCE('link'); pc1.rel = 'preconnect'; pc1.href = 'https://fonts.googleapis.com'; frag.appendChild(pc1);
+        const pc2 = _origCE('link'); pc2.rel = 'preconnect'; pc2.href = 'https://fonts.gstatic.com'; pc2.crossOrigin = 'anonymous'; frag.appendChild(pc2);
+        const fontLink = _origCE('link');
+        fontLink.rel = 'stylesheet';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Karla:wght@400;700&display=swap';
+        fontLink.id = '_apex_font';
+        fontLink.media = 'print';
+        fontLink.onload = function () { this.onload = null; this.media = 'all'; };
+        frag.appendChild(fontLink);
+        head.insertBefore(frag, head.firstChild);
+    } catch (_) {}
+
+    const st = _origCE('style');
+    st.id = '_apex_style';
+    st.textContent = _CSS;
+    const h = D.head || D.documentElement;
+    if (h) h.appendChild(st);
+    _styleEl = st;
 };
 
 if (_on('css')) _injectStyles();
@@ -1150,9 +1033,9 @@ if (_OFF.has('anim') || _OFF.has('cursor')) {
 
 const _ensureStyles = () => {
     try {
-        if (_sacredStyleEl && !_sacredStyleEl.isConnected) {
+        if (_styleEl && !_styleEl.isConnected) {
             const h = D.head || D.documentElement;
-            if (h) { h.appendChild(_sacredStyleEl); if (_perfStyleEl) h.appendChild(_perfStyleEl); }
+            if (h) h.appendChild(_styleEl);
         }
     } catch (_) {}
 };
@@ -1160,13 +1043,15 @@ const _ensureStyles = () => {
 _aEL.call(D, 'DOMContentLoaded', () => {
     try {
         const h = D.head; if (!h) return;
-        const s = D.getElementById('_apex_sacred'), p = D.getElementById('_apex_perf'), f = D.getElementById('_apex_font');
+        const s = D.getElementById('_apex_style'), f = D.getElementById('_apex_font');
         if (s && s.parentNode !== h) h.appendChild(s);
-        if (p && p.parentNode !== h) h.appendChild(p);
         if (f && f.parentNode !== h) h.insertBefore(f, h.firstChild);
     } catch (_) {}
 }, OPT_O);
 
+// ═══════════════════════════════════════════════════════════════════════
+// INTRO
+// ═══════════════════════════════════════════════════════════════════════
 const _initLoader = () => {
     try {
         const loader = _origCE('div'); loader.id = 'apex-loader';
@@ -1249,7 +1134,7 @@ const _initLoader = () => {
         };
         const showLoader = (text, duration) => {
             const textElement = D.getElementById('apex-loader-txt');
-            if (textElement) textElement.innerText = text;
+            if (textElement) textElement.textContent = text;   // v8.0.0: textContent (innerText forzaba layout)
             loader.style.display = 'flex';
             setTimeout(() => { loader.style.opacity = '1'; loader.style.visibility = 'visible'; }, 10);
             clearTimeout(loaderTimeout); if (duration) loaderTimeout = setTimeout(hideLoader, duration);
@@ -1260,6 +1145,9 @@ const _initLoader = () => {
 };
 if (_on('intro')) _loader = _initLoader();
 
+// ═══════════════════════════════════════════════════════════════════════
+// DOM: exclusiones, beautify y barrido
+// ═══════════════════════════════════════════════════════════════════════
 let _chatEl = null, _chatNext = 0;
 const _getChat = () => {
     if (_chatEl && _chatEl.isConnected) return _chatEl;
@@ -1287,19 +1175,6 @@ const _skipLive = (el) => _chatLike(el) || _isLiveHudNode(el);
 
 const _EXCLUDED_HUD_IDS = ['leaderboard-panel', 'score-panel', 'party-panel', 'minimap-panel'];
 let _hudPanels = [], _hudNext = 0;
-// v7.13.0 -- FIX: antes esta función confiaba en la caché de 1s SIN
-// chequear si los elementos cacheados seguían conectados al documento --
-// a diferencia de _getChat() (arriba), que sí revalida _chatEl.isConnected
-// antes de devolver la caché. Si Gota reemplaza el CONTENEDOR entero de
-// uno de estos 4 paneles (no solo su contenido interno) dentro de esa
-// ventana de 1s, la referencia cacheada queda apuntando a un nodo
-// DESCONECTADO -- y .contains() sobre un nodo desconectado solo ve su
-// propio subárbol desconectado, nunca el panel NUEVO y en vivo. El
-// resultado es que el filtro de exclusión de v7.5.0 deja de aplicar en
-// silencio durante esa ventana -- justo el escenario que esa versión
-// arregló (reordenamientos del leaderboard colándose a la cola de
-// barrido), pero de forma intermitente. Ahora se revalida isConnected en
-// los 4 antes de confiar en la caché, mismo patrón que _getChat.
 const _getHudPanels = () => {
     const now = _pNow();
     if (now < _hudNext && _hudPanels.length && _hudPanels.every(p => p.isConnected)) return _hudPanels;
@@ -1431,84 +1306,71 @@ const _processTextNode = (node) => {
     const val = node.nodeValue;
     if (!val) return;
 
+    // 'refresh' (7 chars) es la más corta de las tres cadenas: nada más corto puede contenerlas.
     if (val.length >= 7) {
-    if (val.includes('arrow_range')) {
-        const parent = node.parentElement;
-        if (parent && !parent.classList.contains('apex-linesplit-fixed')) {
-            parent.classList.add('apex-linesplit-fixed');
-            node.nodeValue = val.replace('arrow_range', '');
-            parent.style.color = '';
-            parent.style.border = '';
-            parent.style.background = '';
-        } else if (parent) {
-            node.nodeValue = val.replace('arrow_range', '');
+        if (val.includes('arrow_range')) {
+            const parent = node.parentElement;
+            if (parent && !parent.classList.contains('apex-linesplit-fixed')) {
+                parent.classList.add('apex-linesplit-fixed');
+                node.nodeValue = val.replace('arrow_range', '');
+                parent.style.color = '';
+                parent.style.border = '';
+                parent.style.background = '';
+            } else if (parent) {
+                node.nodeValue = val.replace('arrow_range', '');
+            }
+            _watchBeautifyNode(node);
+            return;
         }
-        _watchBeautifyNode(node);
-        return;
-    }
-    if (val.includes('refresh')) {
-        const parent = node.parentElement;
-        if (parent && !parent.classList.contains('apex-timer-icon-fixed') && !parent.classList.contains('apex-timer-container')) {
-            if (parent.tagName === 'I' || parent.classList.contains('material-icons')) {
-                parent.classList.add('apex-timer-icon-fixed');
-                node.nodeValue = val.replace('refresh', '');
+        if (val.includes('refresh')) {
+            const parent = node.parentElement;
+            if (parent && !parent.classList.contains('apex-timer-icon-fixed') && !parent.classList.contains('apex-timer-container')) {
+                if (parent.tagName === 'I' || parent.classList.contains('material-icons')) {
+                    parent.classList.add('apex-timer-icon-fixed');
+                    node.nodeValue = val.replace('refresh', '');
 
-                let container = parent.parentElement;
-                if (container && container.tagName === 'SPAN') container = container.parentElement;
-                if (container && container !== D.body) {
-                    container.classList.add('apex-timer-container');
-                    container.style.background = '';
-                    container.style.border = '';
-                    container.style.boxShadow = '';
+                    let container = parent.parentElement;
+                    if (container && container.tagName === 'SPAN') container = container.parentElement;
+                    if (container && container !== D.body) {
+                        container.classList.add('apex-timer-container');
+                        container.style.background = '';
+                        container.style.border = '';
+                        container.style.boxShadow = '';
+                    }
+                } else {
+                    parent.classList.add('apex-timer-container');
+                    parent.classList.add('apex-timer-no-i-tag');
+                    node.nodeValue = val.replace('refresh', '');
                 }
-            } else {
-                parent.classList.add('apex-timer-container');
-                parent.classList.add('apex-timer-no-i-tag');
+            } else if (parent && (parent.classList.contains('apex-timer-icon-fixed') || parent.classList.contains('apex-timer-container'))) {
                 node.nodeValue = val.replace('refresh', '');
             }
-        } else if (parent && (parent.classList.contains('apex-timer-icon-fixed') || parent.classList.contains('apex-timer-container'))) {
-            node.nodeValue = val.replace('refresh', '');
+            _watchBeautifyNode(node);
+            return;
         }
-        _watchBeautifyNode(node);
-        return;
-    }
-    if (val.includes('Camlan Build')) {
-        node.nodeValue = val.replace('Camlan Build', 'Funkiid Build');
-        return;
-    }
+        if (val.includes('Camlan Build')) {
+            node.nodeValue = val.replace('Camlan Build', 'Funkiid Build');
+            return;
+        }
     }
 
     if (val.length > 24) return;
     const trimmed = val.trim();
 
     switch (trimmed) {
-        case 'Servers': {
-            const btn = node.parentElement;
-            if (btn && !btn.classList.contains('apex-portal-btn')) {
-                btn.classList.add('apex-portal-btn');
-                node.nodeValue = '';
-                const label = _origCE('span');
-                label.className = 'apex-portal-label';
-                label.textContent = 'Servidores';
-                btn.appendChild(label);
-            }
+        case 'Servers':
+            // v8.0.0: se renombra EN el mismo nodo (antes: nodo vaciado + span extra con glow -> texto fantasma).
+            node.nodeValue = 'Servidores';
             break;
-        }
         case 'Play': {
             const btn = node.parentElement;
             const container = btn && btn.parentElement;
             if (container && !container.classList.contains('apex-menu-grid')) container.classList.add('apex-menu-grid');
-            if (btn && !btn.classList.contains('apex-full-row')) btn.classList.add('apex-full-row');
             const panel = _closestMainPanel(container);
             if (panel && panel.parentElement && !panel.parentElement.classList.contains('apex-menu-row')) {
                 panel.parentElement.classList.add('apex-menu-row');
             }
             if (panel && !_apexBuildPanel) { _apexBuildPanel = panel; _tryAssembleMenuLayout(); }
-            break;
-        }
-        case 'Spectate': {
-            const btn = node.parentElement;
-            if (btn && !btn.classList.contains('apex-full-row')) btn.classList.add('apex-full-row');
             break;
         }
         case 'Options':    { const b = node.parentElement; if (b && !_apexOptionsBtn)   { _apexOptionsBtn = b;   _tryAssembleExtraGrid(); } break; }
@@ -1533,173 +1395,127 @@ const _processTextNode = (node) => {
     }
 };
 
-const _walkFilter = {
-    acceptNode(n) {
-        if (n.nodeType === 3) return NodeFilter.FILTER_ACCEPT;
-        const tag = n.tagName;
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg') return NodeFilter.FILTER_REJECT;
-        if (_skipLive(n)) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_SKIP;
+// ─── Motor de barrido único (v8.0.0) ─────────────────────────────────────
+// DFS manual resumible: sin TreeWalker ni callback JS por nodo. Un único
+// motor para raíces agregadas por mutaciones Y para el barrido completo
+// (un barrido completo es simplemente la raíz D.body). Tajadas de 4ms;
+// el filtro de chat/HUD/tags excluidos corre acá adentro, NO en el
+// microtask del MutationObserver (que solo encola).
+const _SCAN_EXC = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'CANVAS', 'svg']);
+const _SLICE_MS = 4;
+const _CHECK_EVERY = 32;
+const _ROOT_CAP = 2000;
+
+let _roots = [];
+let _rootSet = new Set();
+let _cur = null, _curRoot = null;       // DFS en curso
+let _sweepTimer = 0, _sweepActive = false;
+let _sweptBatch = [];
+let _chainMs = 0;
+
+const _pushRoot = (node) => {
+    if (!node || _rootSet.has(node)) return;
+    _rootSet.add(node);
+    _roots.push(node);
+    if (_roots.length > _ROOT_CAP) {
+        // desborde: se descarta la cola y cae UNA vez a barrido completo
+        _roots = []; _rootSet = new Set();
+        if (D.body) { _roots.push(D.body); _rootSet.add(D.body); }
     }
 };
+const _requestFull = () => { if (D.body && _curRoot !== D.body) _pushRoot(D.body); };
 
-let _sweepWalker = null, _sweepAccum = 0;
-const _SWEEP_CHUNK = 300;
-const _SWEEP_CHECK_EVERY = 30;
-
-const _sweepStep = (deadline) => {
-    if (!_sweepWalker) return;
-    try {
-        const t0 = _pNow();
-        const canDeadline = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout;
-        let n, processed = 0, check = 0, exhausted = false;
-        while (true) {
-            n = _sweepWalker.nextNode();
-            if (!n) { exhausted = true; break; }
-            if (n.nodeType === 3) _processTextNode(n);
-            processed++;
-            if (++check >= _SWEEP_CHECK_EVERY) {
-                check = 0;
-                if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break;
-            }
-            if (processed >= _SWEEP_CHUNK) break;
-        }
-        _sweepAccum += _pNow() - t0;
-        if (exhausted) {
-            _sweepWalker = null;
-            try { _sanitizeAll(); } catch (_) {}
-            STAT.sweeps++; STAT.sweepMs += _sweepAccum; if (_sweepAccum > STAT.sweepMaxMs) STAT.sweepMaxMs = _sweepAccum;
-            _sweepAccum = 0;
-        } else {
-            _idle(_sweepStep, 500);
-        }
-    } catch (_) {
-        _sweepWalker = null; _sweepAccum = 0;
+// siguiente nodo en preorden dentro de root (nunca sale de root)
+const _nextNode = (n, root, skip) => {
+    if (!skip) { const c = n.firstChild; if (c) return c; }
+    while (n !== root) {
+        const s = n.nextSibling;
+        if (s) return s;
+        n = n.parentNode;
+        if (!n) return null;
     }
+    return null;
 };
 
-const _sweepAll = (deadline) => {
-    try {
-        _ensureStyles();
-        if (!D.body || _sweepWalker || _queueWalker) return;
-        _sweepAccum = 0;
-        _sweepWalker = D.createTreeWalker(D.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
-        _sweepStep(deadline || {});
-    } catch (_) { _sweepWalker = null; }
-};
-const _sweepSoon = (ms) => { if (_on('dom')) _st(() => _idle(_sweepAll, 500), ms); };
-
-let _sweepQueue = [];
-let _sweepQueueSet = new Set();
-let _forcedFullSweep = false;
-const _SWEEP_QUEUE_CAP = 2000;
-
-const _queueSweepRoot = (node) => {
-    if (!node || _sweepQueueSet.has(node)) return;
-    _sweepQueueSet.add(node);
-    _sweepQueue.push(node);
-    if (_sweepQueue.length > _SWEEP_QUEUE_CAP) {
-        _sweepQueue = [];
-        _sweepQueueSet = new Set();
-        _forcedFullSweep = true;
+const _rootOk = (root, chat, hud) => {
+    if (!root.isConnected) return false;
+    const t = root.nodeType;
+    if (t === 1) {
+        if (root !== D.body && (_SCAN_EXC.has(root.tagName) || _skipLive(root))) return false;
+    } else if (t !== 3) {
+        return false;
     }
+    if (chat && chat.contains(root)) return false;
+    if (hud.length && _insideAny(root, hud)) return false;
+    return true;
 };
 
-let _queueWalker = null, _queueAccum = 0;
-let _sweptRootsBatch = [];
-const _flushQueueStep = (deadline) => {
+const _sweepSlice = () => {
+    const t0 = _pNow();
+    let cnt = 0, paused = false;
     try {
-        const t0 = _pNow();
-        const canDeadline = deadline && typeof deadline.timeRemaining === 'function' && !deadline.didTimeout;
-        let processed = 0, check = 0;
-        const chat = _getChat();
-        const hudPanels = _getHudPanels();
-
-        while (true) {
-            if (_queueWalker) {
-                const n = _queueWalker.nextNode();
-                if (!n) { _queueWalker = null; continue; }
-                if (n.nodeType === 3) _processTextNode(n);
-            } else {
-                const root = _sweepQueue.length ? _sweepQueue.pop() : undefined;
+        const chat = _getChat(), hud = _getHudPanels();
+        if (_cur !== null && !_curRoot.isConnected) { _cur = null; _curRoot = null; }
+        for (;;) {
+            if ((++cnt & (_CHECK_EVERY - 1)) === 0 && (_pNow() - t0 >= _SLICE_MS || _isInputPending())) { paused = true; break; }
+            if (_cur === null) {
+                const root = _roots.length ? _roots.pop() : undefined;
                 if (root === undefined) break;
-                _sweepQueueSet.delete(root);
-
-                let keep = root.isConnected;
-                if (keep) {
-                    if (root.nodeType === 1) {
-                        const tag = root.tagName;
-                        keep = !(tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'CANVAS' || tag === 'svg' || _skipLive(root));
-                    } else if (root.nodeType !== 3) {
-                        keep = false;
-                    }
-                }
-                if (keep && chat && chat.contains(root)) keep = false;
-                if (keep && hudPanels.length && _insideAny(root, hudPanels)) keep = false;
-
-                if (keep) {
-                    _sweptRootsBatch.push(root);
-                    if (root.nodeType === 3) _processTextNode(root);
-                    else _queueWalker = D.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, _walkFilter);
-                }
+                _rootSet.delete(root);
+                if (!_rootOk(root, chat, hud)) continue;
+                if (root.nodeType === 3) { _processTextNode(root); continue; }
+                _sweptBatch.push(root);
+                _curRoot = root;
+                _cur = root.firstChild;
+                if (_cur === null) _curRoot = null;
+                continue;
             }
-
-            processed++;
-            if (++check >= _SWEEP_CHECK_EVERY) {
-                check = 0;
-                if (_isInputPending() || (canDeadline && deadline.timeRemaining() <= 1)) break;
-            }
-            if (processed >= _SWEEP_CHUNK) break;
+            const n = _cur;
+            let skip = false;
+            if (n.nodeType === 3) _processTextNode(n);
+            else if (n.nodeType === 1) skip = _SCAN_EXC.has(n.tagName) || _skipLive(n);
+            _cur = _nextNode(n, _curRoot, skip);
+            if (_cur === null) _curRoot = null;
         }
+    } catch (_) { _cur = null; _curRoot = null; }
 
-        _queueAccum += _pNow() - t0;
+    const dt = _pNow() - t0;
+    _chainMs += dt;
+    if (dt > STAT.sliceMaxMs) STAT.sliceMaxMs = dt;
 
-        if (_queueWalker || _sweepQueue.length) {
-            _idle(_flushQueueStep, 500);
-        } else {
-            try { _sanitizeRoots(_sweptRootsBatch); } catch (_) {}
-            _sweptRootsBatch = [];
-            STAT.sweeps++; STAT.sweepMs += _queueAccum; if (_queueAccum > STAT.sweepMaxMs) STAT.sweepMaxMs = _queueAccum;
-            _queueAccum = 0;
-        }
-    } catch (_) {
-        _queueWalker = null; _queueAccum = 0; _sweepQueue = []; _sweepQueueSet = new Set(); _sweptRootsBatch = [];
-    }
+    if (paused || _cur !== null || _roots.length) { _idle(_sweepSlice, 500); return; }
+
+    // cadena terminada
+    _sweepActive = false;
+    STAT.sweeps++; STAT.sweepMs += _chainMs; if (_chainMs > STAT.sweepMaxMs) STAT.sweepMaxMs = _chainMs;
+    _chainMs = 0;
+    const b = _sweptBatch; _sweptBatch = [];
+    try { if (b.length > 48 || b.indexOf(D.body) !== -1) _sanitizeAll(); else _sanitizeRoots(b); } catch (_) {}
 };
 
-let _flushTimer = 0;
-const _flush = () => {
-    _flushTimer = 0;
-    if (_tabHidden) return;
-    if (_sweepWalker || _queueWalker) {
-        _flushTimer = _st(_flush, 250);
-        return;
-    }
-    if (_forcedFullSweep) {
-        _forcedFullSweep = false;
-        _sweepQueue = []; _sweepQueueSet = new Set();
-        STAT.flushes++;
-        _idle(_sweepAll, 500);
-        return;
-    }
-    if (!_sweepQueue.length) return;
-    STAT.flushes++;
-    _idle(_flushQueueStep, 500);
+const _startSweep = () => {
+    if (_sweepTimer) { _ct(_sweepTimer); _sweepTimer = 0; }
+    if (_sweepActive) return;
+    if (_cur === null && !_roots.length) return;
+    _sweepActive = true; _chainMs = 0; STAT.flushes++;
+    _ensureStyles();
+    _idle(_sweepSlice, 500);
 };
+const _kick = (ms) => { if (_sweepTimer || _sweepActive) return; _sweepTimer = _st(_startSweep, ms); };
+
+const _sweepSoon = (ms) => { if (_on('dom')) _st(() => { _requestFull(); _startSweep(); }, ms); };
+
 const _moCb = (recs) => {
-    if (_forcedFullSweep) {
-        if (!_flushTimer) _flushTimer = _st(_flush, _inGame ? 4000 : 300);
-        return;
-    }
     for (let i = 0; i < recs.length; i++) {
         const added = recs[i].addedNodes;
-        for (let j = 0; j < added.length; j++) _queueSweepRoot(added[j]);
+        for (let j = 0; j < added.length; j++) _pushRoot(added[j]);
     }
-    if ((_sweepQueue.length || _forcedFullSweep) && !_flushTimer) {
-        _flushTimer = _st(_flush, _inGame ? 4000 : 300);
-    }
+    if (_roots.length) _kick(_inGame ? 4000 : 300);
 };
 
+// ═══════════════════════════════════════════════════════════════════════
+// ESTADO in-game / join
+// ═══════════════════════════════════════════════════════════════════════
 const _isVisible = (el) => {
     if (!el || !el.isConnected) return false;
     if (typeof el.checkVisibility === 'function') {
@@ -1734,7 +1550,8 @@ const _handleJoin = () => {
         if (e.target.closest('#btn-play, .play-btn, button[id*="play" i], button[class*="play" i]')) _handleJoin();
     };
     const _onMenuKeydown = (e) => {
-        if (e.key !== 'Enter') return;
+        // v8.0.0: en partida Enter abre el chat -- antes disparaba _handleJoin (3 barridos + blur) en cada pulsación
+        if (_inGame || e.key !== 'Enter') return;
         const activeTag = D.activeElement ? D.activeElement.tagName.toLowerCase() : '';
         if (activeTag !== 'input' && activeTag !== 'textarea') _handleJoin();
     };
@@ -1750,7 +1567,7 @@ const _handleJoin = () => {
 if (_on('dom')) {
     try { new MutationObserver(_moCb).observe(D, { childList: true, subtree: true }); } catch (_) {}
 
-    const _initSweeps = () => { _nukeAdPanels(); _sweepAll(); };
+    const _initSweeps = () => { _nukeAdPanels(); _requestFull(); _startSweep(); };
     _aEL.call(D, 'DOMContentLoaded', _initSweeps, OPT_O);
     try { _aEL.call(W, 'load', _initSweeps, OPT_O); } catch (_) {}
     _st(_initSweeps, 1200);
@@ -1758,7 +1575,7 @@ if (_on('dom')) {
     _st(_initSweeps, 8000);
 
     _si(() => {
-        if (_tabHidden || _pNow() < _joinGraceUntil) return;
+        if (_pNow() < _joinGraceUntil) return;
         const menuVisible = _apexMenuWrapper
             ? _isVisible(_apexMenuWrapper)
             : (_isVisible(_apexBuildPanel) || _isVisible(_apexProfilePanel));
